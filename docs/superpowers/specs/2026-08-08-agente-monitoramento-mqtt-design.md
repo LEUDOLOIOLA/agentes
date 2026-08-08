@@ -39,6 +39,7 @@ Ficam fora do primeiro escopo:
 - `0` representa `0 bar` e `4096` representa `4 bar`.
 - A publicação esperada ocorre a cada 5 minutos.
 - O agente permanece conectado continuamente; não se conecta apenas a cada 15 minutos.
+- O serviço usa regras determinísticas locais e não chama modelos de linguagem ou APIs de IA durante a operação. A conexão MQTT e o processamento das medições não consomem tokens de IA.
 - Cada mensagem recebe um timestamp UTC de chegada gerado pelo agente.
 - O flag MQTT `retain`, quando disponível, é armazenado. Uma mensagem retida recebida na conexão inicial não comprova atividade recente, não atualiza o prazo de ausência e não abre nem encerra alarmes de processo; ela pode ser exibida apenas como último estado não confirmado.
 
