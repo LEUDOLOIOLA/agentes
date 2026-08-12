@@ -27,8 +27,9 @@ Ficam fora do primeiro escopo:
 - comando automático de bombas ou válvulas;
 - painel web ou aplicativo móvel;
 - alta disponibilidade com segundo computador;
-- modelos de aprendizado de máquina;
 - integração com canais diferentes de Gmail.
+
+A análise estatística consultiva pela API da OpenAI é especificada separadamente em `2026-08-10-openai-analista-estatistico-design.md`. Ela não altera os limites de segurança nem a natureza supervisória deste agente.
 
 ## 3. Requisitos confirmados
 
@@ -39,7 +40,7 @@ Ficam fora do primeiro escopo:
 - `0` representa `0 bar` e `4096` representa `4 bar`.
 - A publicação esperada ocorre a cada 5 minutos.
 - O agente permanece conectado continuamente; não se conecta apenas a cada 15 minutos.
-- O serviço usa regras determinísticas locais e não chama modelos de linguagem ou APIs de IA durante a operação. A conexão MQTT e o processamento das medições não consomem tokens de IA.
+- Aquisição, validação, estados e alarmes usam regras determinísticas locais e não dependem de modelos de linguagem. A camada consultiva OpenAI executa separadamente a cada 4 horas e consome tokens apenas nessas análises.
 - Cada mensagem recebe um timestamp UTC de chegada gerado pelo agente.
 - O flag MQTT `retain`, quando disponível, é armazenado. Uma mensagem retida recebida na conexão inicial não comprova atividade recente, não atualiza o prazo de ausência e não abre nem encerra alarmes de processo; ela pode ser exibida apenas como último estado não confirmado.
 
@@ -86,7 +87,9 @@ Broker MQTT
     -> Gmail
 ```
 
-O agente será um único serviço Python para Windows, dividido internamente em componentes pequenos e testáveis.
+O núcleo de aquisição e alarmes será um único serviço Python para Windows, dividido internamente em componentes pequenos e testáveis.
+
+Um segundo serviço Windows, executado em processo separado e com prioridade inferior, consome o banco operacional somente para leitura e produz análises consultivas pela OpenAI. Ele usa banco, outbox e dispatcher Gmail próprios. Indisponibilidade, atraso ou resposta inválida desse serviço não interfere na aquisição MQTT, nas avaliações de 15 minutos nem nos alarmes locais. O contrato completo está na especificação relacionada de 2026-08-10.
 
 ### 4.1 Receptor MQTT
 
@@ -122,8 +125,9 @@ O SQLite opera em modo WAL e contém, no mínimo:
 
 - `raw_events`: envelope MQTT e resultado da decodificação;
 - `measurements`: valores válidos normalizados;
-- `quality_state`: estado de qualidade por reservatório;
-- `process_state`: estado de processo por reservatório;
+- `quality_state`: projeção do estado de qualidade atual por reservatório;
+- `process_state`: projeção do estado de processo atual por reservatório;
+- `state_transitions`: histórico append-only das duas máquinas de estado;
 - `alarms`: abertura, mudança de severidade, lembretes e recuperação;
 - `outbox`: e-mails aguardando envio ou nova tentativa;
 - `evaluations`: janelas já processadas e versão das regras.
@@ -133,10 +137,15 @@ Cada avaliação possui chave única por reservatório, fim da janela e versão 
 Retenção padrão:
 
 - eventos e medições: 90 dias;
+- transições de estado: 365 dias;
 - alarmes e recuperações: 365 dias;
 - backups diários do banco: últimos 30 arquivos.
 
 Os prazos são configuráveis, mas esses valores são o padrão operacional aprovado.
+
+Cada linha de `state_transitions` contém, no mínimo: `transition_id`, `reservoir_id`, `machine` (`quality` ou `process`), `previous_state`, `new_state`, `effective_at_utc`, `recorded_at_utc`, `rule_version`, `trigger_kind`, `trigger_event_id` opcional e `evaluation_id` opcional. `effective_at_utc` representa quando a condição passou a valer; `recorded_at_utc`, quando o serviço confirmou e persistiu a transição. Os timestamps são UTC. Uma chave de idempotência estável impede repetir a mesma transição após reinício.
+
+O histórico não é atualizado ou apagado antes do prazo de retenção. `quality_state` e `process_state` são projeções reconstruíveis a partir da última transição, não substitutos do histórico. Na primeira ativação do monitoramento, são gravadas as transições iniciais `<none> -> INITIALIZING` e `<none> -> UNKNOWN`, com `effective_at_utc` igual ao início da ativação. Reinícios recuperam as últimas transições e não criam novos estados iniciais.
 
 ### 4.4 Motor de regras
 
@@ -158,6 +167,25 @@ NORMAL <-> HIGH_WARNING <-> OVERFLOW_RISK
 ```
 
 Uma falha de qualidade nunca encerra um alarme de processo. Nesse caso, o último estado do processo permanece aberto com a indicação de que não está sendo confirmado por medição confiável.
+
+Quando condições de qualidade coexistem, a precedência é:
+
+```text
+COMMUNICATION_LOST > MISSING > INVALID > STUCK > GOOD > INITIALIZING
+```
+
+`INITIALIZING` é usado somente antes de existir contexto suficiente para classificar a qualidade. `MISSING` representa a falta de mensagem no prazo; tráfego inválido recente impede `MISSING`, mas mantém `INVALID`. A severidade de ausência aos 30 minutos pertence ao alarme associado e não cria outro nome de estado.
+
+O instante efetivo de uma transição é determinístico:
+
+- condição causada por mensagem: `received_at` do evento que completa a regra;
+- `MISSING`: instante da última mensagem nova mais 15 minutos; sem mensagem desde a ativação, usa o horário da ativação como origem;
+- `COMMUNICATION_LOST`: início da desconexão mais 5 minutos;
+- `STUCK`: o mais tardio entre a primeira leitura da sequência mais 30 minutos e a sexta mensagem nova igual;
+- recuperação com duas confirmações: `received_at` da segunda confirmação;
+- recuperação de comunicação: `received_at` da primeira leitura nova e válida após a reconexão.
+
+Uma avaliação pode ocorrer depois desse instante; nesse caso, preserva o `effective_at_utc` calculado e usa seu horário de persistência como `recorded_at_utc`. Quando uma condição prioritária termina, o novo estado é a condição ainda ativa de maior precedência. A máquina de processo só transita por uma leitura confiável ou por confirmações de histerese; enquanto a qualidade não estiver `GOOD`, ela mantém o último estado.
 
 ## 5. Regras de qualidade da medição
 
@@ -185,6 +213,10 @@ Uma medição entra em quarentena e não atualiza o nível confiável quando:
 - difere em mais de `0,4 bar` da última medição válida recebida dentro dos 15 minutos anteriores.
 
 A primeira ocorrência abre um alerta de medição inválida. Ocorrências consecutivas ou 15 minutos sem uma nova leitura confiável agravam a severidade. Uma leitura suspeita isolada nunca é usada para limpar ou inverter um alarme de processo.
+
+A elegibilidade é decidida por evento e não muda retroativamente. São rejeitados como medição apenas: falha de parsing/formato, valor fora de `0..4096` e salto superior a `0,4 bar` colocado em quarentena. Um estado de qualidade posterior não recategoriza eventos anteriores.
+
+Leituras numericamente válidas e sem salto durante `STUCK` continuam armazenadas em `measurements`, marcadas com o estado de qualidade vigente e podem compor estatísticas descritivas. Elas não são usadas para limpar, reduzir ou inverter alarmes de processo enquanto `STUCK` estiver ativo. A recuperação exige as duas confirmações da seção 5.2; somente após a segunda a máquina volta a `GOOD` e o nível volta a ser confirmado para decisões de recuperação. `INVALID` termina ao chegar uma medição aceita, sujeita à precedência das demais condições ainda ativas.
 
 ### 5.4 Perda de comunicação
 
@@ -222,7 +254,7 @@ Para cada reservatório, uma avaliação:
 1. verifica a saúde do receptor e do broker;
 2. busca mensagens e medições da janela;
 3. atualiza a qualidade;
-4. usa como valor atual a medição válida mais recente e calcula a tendência apenas com dados válidos;
+4. usa como valor operacional a medição confiável mais recente e calcula a tendência somente com medições aceitas pelas regras por evento;
 5. atualiza o estado do processo;
 6. grava transições e eventos de alarme;
 7. insere notificações necessárias na outbox.
@@ -324,7 +356,11 @@ Segredos ficam em variáveis protegidas da conta do serviço ou no Gerenciador d
 - salto acima de `0,4 bar` em 15 minutos;
 - ausência aos 15 e 30 minutos;
 - valor inalterado por 30 minutos com pelo menos seis mensagens;
-- dado inválido não limpando alarme de processo.
+- dado inválido não limpando alarme de processo;
+- precedência de condições simultâneas de qualidade;
+- `effective_at_utc` exato para timeout, travamento e recuperação, mesmo quando a avaliação ocorre depois;
+- leitura aceita durante `STUCK` persistida sem limpar ou inverter alarme de processo;
+- recuperação posterior sem recategorizar eventos históricos.
 
 ### 12.2 Testes de integração
 
@@ -334,6 +370,7 @@ Segredos ficam em variáveis protegidas da conta do serviço ou no Gerenciador d
 - desconexão, reconexão e retomada da sessão;
 - criação e recuperação das janelas de 15 minutos;
 - persistência e restauração após reinício;
+- histórico append-only de transições, reconstrução das projeções e idempotência após reinício;
 - indisponibilidade temporária do Gmail e drenagem posterior da outbox;
 - limpeza por retenção e criação/rotação de backups.
 
