@@ -1,15 +1,15 @@
 # MQTT Core Implementation Plan
 
-> **Atenção (2026-10-31):** a plataforma mudou de Windows para VPS Linux com systemd, e a camada consultiva passou a usar Claude Code headless. Antes de executar, aplique a seção 6 de `../specs/2026-10-31-migracao-vps-claude-code-design.md`.
+> **Revisão 2026-10-31:** plano reescrito para VPS Linux com `systemd`, conforme `../specs/2026-10-31-migracao-vps-claude-code-design.md`. As regras de domínio são as da especificação-base de 2026-08-08.
 
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Construir o serviço Windows determinístico que recebe continuamente os dois tópicos MQTT, persiste eventos auditáveis, detecta riscos de nível e falhas de medição e entrega alertas pelo Gmail sem controlar equipamentos.
+**Goal:** Construir o serviço `systemd` determinístico, em VPS Linux, que recebe continuamente os dois tópicos MQTT, persiste eventos auditáveis, detecta riscos de nível e falhas de medição e entrega alertas pelo Gmail sem controlar equipamentos.
 
-**Architecture:** Um único processo `agente_mqtt` usa Paho MQTT com QoS 1 e ACK manual, um escritor SQLite serializado e máquinas de estado puras. Ingestão, transições, alarmes e outbox são gravados na mesma transação; o ACK só ocorre após o commit. Agendamento, SMTP e serviço Windows ficam atrás de interfaces injetáveis para que as regras sejam testadas sem rede ou relógio real.
+**Architecture:** Um único processo `agente_mqtt` usa Paho MQTT com QoS 1 e ACK manual, um escritor SQLite serializado e máquinas de estado puras. Ingestão, transições, alarmes e outbox são gravados na mesma transação; o ACK só ocorre após o commit. Agendamento, SMTP e integração com `systemd` (notify/watchdog/credentials) ficam atrás de interfaces injetáveis para que as regras sejam testadas sem rede ou relógio real.
 
-**Tech Stack:** CPython 3.12 x64, biblioteca padrão (`sqlite3`, `ssl`, `smtplib`, `tomllib`, `zoneinfo`, `logging`), `paho-mqtt==2.1.0`, `pywin32==312`, `tzdata==2026.3`, `pytest==9.1.1`, `pytest-cov==7.1.0`.
+**Tech Stack:** CPython 3.12 x64, biblioteca padrão (`sqlite3`, `ssl`, `smtplib`, `tomllib`, `zoneinfo`, `logging`), `paho-mqtt==2.1.0`, `tzdata==2026.3`, `pytest==9.1.1`, `pytest-cov==7.1.0`.
 
 ## Global Constraints
 
@@ -24,7 +24,9 @@
 - TLS com validação de certificado é obrigatório fora de fixture local; mínimo TLS 1.2.
 - Usar timestamps UTC aware no domínio e `ZoneInfo("America/Fortaleza")` somente para alinhamento operacional.
 - SQLite em WAL, foreign keys habilitadas, transações explícitas e conexões não compartilhadas entre threads.
-- Segredos somente por Windows Credential Manager ou variável protegida da conta de serviço; nunca em TOML, log ou Git.
+- Segredos somente por `systemd` `LoadCredential=` (arquivos em `$CREDENTIALS_DIRECTORY`, origem `/etc/credstore/` modo `0600`); nunca em TOML, variável de ambiente, log ou Git.
+- Plataforma-alvo: Ubuntu Server 24.04 LTS (ou LTS com `systemd` ≥ 255), CPython 3.12, serviço sob o usuário `agente-mqtt` sem shell e sem `root`.
+- Integração `systemd` sem dependências externas: `sd_notify` implementado via socket `AF_UNIX` em `NOTIFY_SOCKET` (`READY=1`, `WATCHDOG=1`, `STOPPING=1`, `STATUS=`).
 - SMTP não garante exactly-once após resultado incerto. A garantia implementável é: uma notificação lógica por fingerprint e `Message-ID` determinístico; um aceite SMTP seguido de falha antes do `mark_sent` pode ser reenviado.
 - Cada tarefa segue red-green-refactor e termina com commit próprio; não combinar tarefas adjacentes.
 
@@ -40,11 +42,14 @@ config/
   mqtt-core.example.toml
 resources/contracts/
   operational_v1.json
+deploy/systemd/
+  mqtt-core.service
+deploy/
+  agente-mqtt.tmpfiles.conf
 scripts/
-  install-mqtt-core.ps1
-  uninstall-mqtt-core.ps1
-  configure-mqtt-core-recovery.ps1
-  verify-mqtt-core.ps1
+  install-mqtt-core.sh
+  uninstall-mqtt-core.sh
+  verify-mqtt-core.sh
 src/agente_mqtt/
   __init__.py
   __main__.py
@@ -83,7 +88,8 @@ src/agente_mqtt/
     health.py
   service/
     paths.py
-    windows_service.py
+    systemd_notify.py
+    linux_service.py
 tests/
   conftest.py
   unit/
@@ -159,7 +165,7 @@ class CoreApplication(Protocol):
 
 **Interfaces:**
 - Consumes: nenhuma; esta é a raiz do projeto.
-- Produces: `CoreConfig`, `load_config(path: Path) -> CoreConfig`, `SystemClock`, `WindowsCredentialProvider` e as constantes `RESERVOIR_TOPICS`.
+- Produces: `CoreConfig`, `load_config(path: Path) -> CoreConfig`, `SystemClock`, `SystemdCredentialProvider` e as constantes `RESERVOIR_TOPICS`.
 
 - [ ] **Step 1: Escrever os testes de configuração e o bootstrap mínimo**
 
@@ -198,12 +204,12 @@ Criar neste passo o `pyproject.toml` mínimo com `src` layout e os três lockfil
 
 Run:
 
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install --require-hashes -r requirements/build.lock
-.venv\Scripts\python.exe -m pip install --require-hashes -r requirements/production.lock
-.venv\Scripts\python.exe -m pip install --require-hashes -r requirements/test.lock
-.venv\Scripts\python.exe -m pytest tests/unit/test_config.py -v
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements/build.lock
+.venv/bin/python -m pip install --require-hashes -r requirements/production.lock
+.venv/bin/python -m pip install --require-hashes -r requirements/test.lock
+.venv/bin/python -m pytest tests/unit/test_config.py -v
 ```
 
 Expected: FAIL durante import porque `agente_mqtt.config` ainda não existe.
@@ -222,7 +228,6 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "paho-mqtt==2.1.0",
-  "pywin32==312; sys_platform == 'win32'",
   "tzdata==2026.3",
 ]
 
@@ -234,7 +239,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
 markers = [
-  "operational: requires Windows service privileges",
+  "operational: requires root on a systemd host",
   "live: calls a paid external API",
   "mosquitto: requires a local Mosquitto executable",
   "soak: long-running operational test",
@@ -335,22 +340,22 @@ def load_config(path: Path) -> CoreConfig:
     )
 ```
 
-`resource_directory` é absoluto e aponta para `C:\\ProgramData\\AgenteMQTT\\Core\\resources`; nenhum loader pode depender do current working directory do SCM. `[topics]` deve conter exatamente o mapeamento `0051/0022` aprovado, sem curingas nem terceiro tópico. `[rules]` traz e valida escala `1024`, limites `1.0/1.05/1.15/1.2`, publicação esperada `5`, avaliação `15`, comunicação `5`, missing `15/30`, stuck `6/30`, salto `0.4` com lookback `15`, tendência `3` amostras/`10` minutos/horizonte `15`, confirmação mínima `4`, reminder `60`, retry SMTP máximo `60`, integridade `08:00`, manutenção diária padrão `02:00` e toda histerese aprovada. `[retention]` traz raw/measurements `90`, transitions/alarms `365` e backups `30`; estes prazos permanecem configuráveis com limites seguros, enquanto alterações de escala/limites/regras exigem nova `rule_version` e aprovação. Adicionar teste que muda retenção dentro do intervalo aceito e rejeita tópicos diferentes, limites invertidos, escala não positiva, tempos não crescentes ou chaves extras.
+`resource_directory` é absoluto e aponta para `/opt/agente-mqtt/resources`; nenhum loader pode depender do current working directory definido pelo `systemd` (`WorkingDirectory=/`). `[topics]` deve conter exatamente o mapeamento `0051/0022` aprovado, sem curingas nem terceiro tópico. `[rules]` traz e valida escala `1024`, limites `1.0/1.05/1.15/1.2`, publicação esperada `5`, avaliação `15`, comunicação `5`, missing `15/30`, stuck `6/30`, salto `0.4` com lookback `15`, tendência `3` amostras/`10` minutos/horizonte `15`, confirmação mínima `4`, reminder `60`, retry SMTP máximo `60`, integridade `08:00`, manutenção diária padrão `02:00` e toda histerese aprovada. `[retention]` traz raw/measurements `90`, transitions/alarms `365` e backups `30`; estes prazos permanecem configuráveis com limites seguros, enquanto alterações de escala/limites/regras exigem nova `rule_version` e aprovação. Adicionar teste que muda retenção dentro do intervalo aceito e rejeita tópicos diferentes, limites invertidos, escala não positiva, tempos não crescentes ou chaves extras.
 
-Implementar `SystemClock.utc_now()` com `datetime.now(timezone.utc)` e, em `clock.py`, importar o módulo como `import time as time_module` para implementar `SystemClock.monotonic()` com `time_module.monotonic()` sem colidir com `LocalTime`. `WindowsCredentialProvider.get_required()` usa `win32cred.CredRead` somente em Windows. O TOML de exemplo deve conter os campos acima, valores não secretos e caminhos `C:\\ProgramData\\AgenteMQTT\\...`. `tests/conftest.py` registra desde esta tarefa `--run-operational`, `--run-live`, `--run-mosquitto`, `--run-soak`, `--mqtt-host` e `--duration-hours`; markers externos são pulados por padrão e só rodam com seu opt-in correspondente.
+Implementar `SystemClock.utc_now()` com `datetime.now(timezone.utc)` e, em `clock.py`, importar o módulo como `import time as time_module` para implementar `SystemClock.monotonic()` com `time_module.monotonic()` sem colidir com `LocalTime`. `SystemdCredentialProvider.get_required(name)` lê `Path(os.environ["CREDENTIALS_DIRECTORY"]) / name`, remove apenas o `\n` final, rejeita nome com `/` ou `..`, arquivo vazio, link simbólico e ausência de `CREDENTIALS_DIRECTORY`, sempre com `ConfigError` que cita o nome da credencial e nunca o conteúdo. Testes usam `tmp_path` e `monkeypatch.setenv`. O TOML de exemplo deve conter os campos acima, valores não secretos e caminhos absolutos Linux: `database_path = "/var/lib/agente-mqtt/operational.sqlite"`, `backup_directory = "/var/backups/agente-mqtt"`, `log_directory = "/var/log/agente-mqtt"`, `resource_directory = "/opt/agente-mqtt/resources"` e `mqtt.ca_file = "/etc/agente-mqtt/broker-ca.pem"` (ou `/etc/ssl/certs/ca-certificates.crt` quando o broker usar CA pública). `tests/conftest.py` registra desde esta tarefa `--run-operational`, `--run-live`, `--run-mosquitto`, `--run-soak`, `--mqtt-host` e `--duration-hours`; markers externos são pulados por padrão e só rodam com seu opt-in correspondente.
 
 Os três lockfiles devem conter versões e hashes completos, inclusive dependências transitivas e `setuptools==80.9.0`. Após criar o pacote, concluir o bootstrap reproduzível:
 
-```powershell
-.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .
-.venv\Scripts\python.exe -m pip check
+```bash
+.venv/bin/python -m pip install --no-build-isolation --no-deps -e .
+.venv/bin/python -m pip check
 ```
 
-Configurar também `[tool.setuptools.packages.find] where = ["src"]`. Todos os comandos Python das tarefas seguintes usam explicitamente `.venv\Scripts\python.exe`; nunca dependem de pacotes globais.
+Configurar também `[tool.setuptools.packages.find] where = ["src"]`. Todos os comandos Python das tarefas seguintes usam explicitamente `.venv/bin/python`; nunca dependem de pacotes globais.
 
 - [ ] **Step 4: Executar testes e inspeção de segredos**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_config.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_config.py -v`
 
 Expected: PASS.
 
@@ -360,7 +365,7 @@ Expected: nenhuma credencial literal.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add pyproject.toml requirements config src/agente_mqtt/__init__.py src/agente_mqtt/clock.py src/agente_mqtt/config.py src/agente_mqtt/secrets.py src/agente_mqtt/domain/__init__.py src/agente_mqtt/mqtt/__init__.py src/agente_mqtt/storage/__init__.py src/agente_mqtt/scheduling/__init__.py src/agente_mqtt/notifications/__init__.py src/agente_mqtt/observability/__init__.py src/agente_mqtt/service/__init__.py tests/conftest.py tests/unit/test_config.py
 git commit -m "build: scaffold MQTT core configuration"
 ```
@@ -425,7 +430,7 @@ def test_fingerprint_is_stable_and_order_sensitive() -> None:
 
 - [ ] **Step 2: Executar os testes para observar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_decoding.py tests/unit/test_fingerprints.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_decoding.py tests/unit/test_fingerprints.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -479,13 +484,13 @@ def decode_payload(envelope: MqttEnvelope) -> DecodedMeasurement | DecodeFailure
 
 - [ ] **Step 4: Executar os testes do domínio**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_decoding.py tests/unit/test_fingerprints.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_decoding.py tests/unit/test_fingerprints.py -v`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/domain src/agente_mqtt/mqtt tests/unit/test_decoding.py tests/unit/test_fingerprints.py
 git commit -m "feat: decode and identify MQTT measurements"
 ```
@@ -650,7 +655,7 @@ def test_timestamp_rejects_noncanonical_encodings(bad: str) -> None:
 
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_storage_timestamps.py tests/integration/test_operational_schema.py tests/integration/test_database_writer.py tests/integration/test_core_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_storage_timestamps.py tests/integration/test_operational_schema.py tests/integration/test_database_writer.py tests/integration/test_core_wheel_artifact.py -v`
 
 Expected: FAIL porque migração e writer não existem.
 
@@ -856,7 +861,7 @@ CREATE TABLE maintenance_jobs (
 
 O mesmo arquivo SQL inclui os índices por `(reservoir_id, received_at_utc)`, transições por `(reservoir_id,machine,effective_at_utc)`, alarmes por `(reservoir_id,effective_at_utc)` e outbox por `(status,next_attempt_at_utc)`, além de inserir a única linha de `runtime_health` com `schema_version=1`, `contract_version='operational-v1'`, `rule_version` ainda vazio, `core_ready=0`, `mqtt_session_epoch=0`, `mqtt_connected=0`, `mqtt_subscription_ready=0` e timestamps canônicos. `alarms` é append-only: a condição ativa é a última linha por `alarm_id` cuja lifecycle não foi seguida por `RECOVERED`; `STATUS_UPDATED` registra mudança de confiança sem fechar nem enviar novo alarme.
 
-`resources/contracts/operational_v1.json` é a fonte de build compartilhada e canônica: lista, em ordem, todas as colunas das tabelas lidas pelo Statistical Analyst (`raw_events`, `measurements`, `state_transitions`, `alarms`, `runtime_health` e `operational_contract`), tipos/enums, os dois tópicos, reservatórios, limites, histereses, `rule_version` e `timestamp_format`. Na instalação, ela é copiada de forma atômica para `<resource_directory>\\contracts\\operational_v1.json`; em runtime, o Core usa somente esse caminho absoluto configurado e verifica o SHA-256, inclusive quando o CWD é `C:\\Windows\\System32`. A inicialização grava manifesto e regras com ambos os flags `ready` ainda em zero. Somente depois do catch-up completo a Task 14 marca `operational_contract.ready=1` e `runtime_health.core_ready=1` na mesma transação. Qualquer mudança sem nova versão/fixture falha antes de MQTT. O Analyst compara versão e hash de sua cópia instalada e nunca importa código runtime do Core.
+`resources/contracts/operational_v1.json` é a fonte de build compartilhada e canônica: lista, em ordem, todas as colunas das tabelas lidas pelo Statistical Analyst (`raw_events`, `measurements`, `state_transitions`, `alarms`, `runtime_health` e `operational_contract`), tipos/enums, os dois tópicos, reservatórios, limites, histereses, `rule_version` e `timestamp_format`. Na instalação, ela é copiada de forma atômica para `<resource_directory>/contracts/operational_v1.json`; em runtime, o Core usa somente esse caminho absoluto configurado e verifica o SHA-256, inclusive quando o CWD é `/`. A inicialização grava manifesto e regras com ambos os flags `ready` ainda em zero. Somente depois do catch-up completo a Task 14 marca `operational_contract.ready=1` e `runtime_health.core_ready=1` na mesma transação. Qualquer mudança sem nova versão/fixture falha antes de MQTT. O Analyst compara versão e hash de sua cópia instalada e nunca importa código runtime do Core.
 
 Todo timestamp SQL usa exatamente `YYYY-MM-DDTHH:MM:SS.ffffffZ` em UTC (27 caracteres); `format_utc` rejeita datetime naive e `parse_utc` rejeita `+00:00`, ausência de micros ou offsets. Todas as binds de limites passam por esse serializer, de modo que comparação lexicográfica preserva ordem. O teste compartilhado cobre frações e bordas semiabertas: valor exatamente em `start` entra, exatamente em `end` não entra.
 
@@ -882,13 +887,13 @@ def open_connection(path: Path, *, readonly: bool = False) -> sqlite3.Connection
 
 - [ ] **Step 4: Executar testes de schema, concorrência e rollback**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_storage_timestamps.py tests/integration/test_operational_schema.py tests/integration/test_database_writer.py tests/integration/test_core_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_storage_timestamps.py tests/integration/test_operational_schema.py tests/integration/test_database_writer.py tests/integration/test_core_wheel_artifact.py -v`
 
-Expected: PASS, incluindo duas threads solicitando gravações, apenas uma conexão escritora e wheel isolado capaz de migrar sem checkout. Reinstalar também o ambiente de desenvolvimento com `.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .`.
+Expected: PASS, incluindo duas threads solicitando gravações, apenas uma conexão escritora e wheel isolado capaz de migrar sem checkout. Reinstalar também o ambiente de desenvolvimento com `.venv/bin/python -m pip install --no-build-isolation --no-deps -e .`.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add pyproject.toml resources/contracts/operational_v1.json src/agente_mqtt/storage tests/conftest.py tests/unit/test_storage_timestamps.py tests/integration/test_operational_schema.py tests/integration/test_database_writer.py tests/integration/test_core_wheel_artifact.py
 git commit -m "feat: define operational SQLite contract"
 ```
@@ -973,7 +978,7 @@ def test_packet_id_reuse_same_payload_survives_new_delivery_rollback(core_db, ma
 
 - [ ] **Step 2: Executar testes e confirmar que falham**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_event_ingestion.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_event_ingestion.py -v`
 
 Expected: FAIL porque `EventIngestor` não existe.
 
@@ -1015,13 +1020,13 @@ class EventIngestor:
 
 - [ ] **Step 4: Executar testes e consultar invariantes SQL**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_event_ingestion.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_event_ingestion.py -v`
 
 Expected: PASS; toda `measurement.event_id` referencia exatamente um `raw_event` válido.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/application.py src/agente_mqtt/storage/repositories.py tests/integration/test_event_ingestion.py tests/conftest.py
 git commit -m "feat: persist and quarantine MQTT events"
 ```
@@ -1077,7 +1082,7 @@ def test_crossing_horizon_is_measured_from_as_of_not_last_sample() -> None:
 
 - [ ] **Step 2: Executar teste e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_trend.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_trend.py -v`
 
 Expected: FAIL por módulo ausente.
 
@@ -1127,13 +1132,13 @@ def projects_crossing(estimate: TrendEstimate, target_bar: float, within_minutes
 
 - [ ] **Step 4: Executar testes de tendência**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_trend.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_trend.py -v`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/domain/trend.py tests/unit/test_trend.py
 git commit -m "feat: estimate reservoir pressure trends"
 ```
@@ -1223,7 +1228,7 @@ def test_first_local_dup_counts_once_for_recovery() -> None:
 
 - [ ] **Step 2: Executar testes para confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_quality_machine.py tests/integration/test_quality_transitions.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_quality_machine.py tests/integration/test_quality_transitions.py -v`
 
 Expected: FAIL por classes ausentes.
 
@@ -1265,13 +1270,13 @@ O repositório deve criar no primeiro boot as transições `<none> -> INITIALIZI
 
 - [ ] **Step 4: Executar testes unitários e de reinício**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_quality_machine.py tests/integration/test_quality_transitions.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_quality_machine.py tests/integration/test_quality_transitions.py -v`
 
 Expected: PASS; reiniciar o repositório não cria outra transição inicial e toda projeção é reconstruível pela última transição.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/domain/quality_machine.py src/agente_mqtt/domain/models.py src/agente_mqtt/storage/repositories.py tests/unit/test_quality_machine.py tests/integration/test_quality_transitions.py
 git commit -m "feat: track deterministic measurement quality"
 ```
@@ -1336,7 +1341,7 @@ def test_recovery_boundaries_after_two_confirmations(current, recovery_bar, expe
 
 - [ ] **Step 2: Executar testes para confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_process_machine.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_process_machine.py -v`
 
 Expected: FAIL por módulo ausente.
 
@@ -1366,13 +1371,13 @@ def decide_process(context: ProcessContext) -> ProcessDecision:
 
 - [ ] **Step 4: Executar toda a matriz de processo**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_process_machine.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_process_machine.py -v`
 
 Expected: PASS, incluindo saltos diretos de NORMAL para estado crítico e troca entre lados somente por leituras confiáveis.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/domain/process_machine.py tests/unit/test_process_machine.py
 git commit -m "feat: enforce reservoir process limits and hysteresis"
 ```
@@ -1472,7 +1477,7 @@ def test_accepted_reading_recovers_invalid_unless_higher_precedence_remains(core
 
 - [ ] **Step 2: Executar testes e observar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_rule_engine.py tests/integration/test_alarm_outbox.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_rule_engine.py tests/integration/test_alarm_outbox.py -v`
 
 Expected: FAIL porque `DeterministicRuleEngine` e alarmes ainda não existem.
 
@@ -1505,13 +1510,13 @@ O template persistido na outbox deve conter apenas DTO local, `Message-ID` deter
 
 - [ ] **Step 4: Executar testes de atomicidade e replay**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_rule_engine.py tests/integration/test_alarm_outbox.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_rule_engine.py tests/integration/test_alarm_outbox.py -v`
 
 Expected: PASS; uma falha antes do commit deixa zero transição, zero alarme e zero outbox; replay cria zero duplicatas.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/domain/alarms.py src/agente_mqtt/storage/repositories.py src/agente_mqtt/application.py tests/integration/test_rule_engine.py tests/integration/test_alarm_outbox.py
 git commit -m "feat: persist deterministic alarms and notifications"
 ```
@@ -1573,7 +1578,7 @@ def test_catchup_never_starts_before_activation(scheduler_harness) -> None:
 
 - [ ] **Step 2: Executar testes para confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_scheduler.py tests/integration/test_evaluation_recovery.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_scheduler.py tests/integration/test_evaluation_recovery.py -v`
 
 Expected: FAIL por scheduler ausente.
 
@@ -1615,13 +1620,13 @@ Persistir UTC; usar timezone apenas para alinhamento. `_pending_keys` faz anti-j
 
 - [ ] **Step 4: Executar testes de scheduler e restart**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_scheduler.py tests/integration/test_evaluation_recovery.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_scheduler.py tests/integration/test_evaluation_recovery.py -v`
 
 Expected: PASS sem aguardar tempo real, usando `FakeClock` e `threading.Event` fake.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/scheduling tests/unit/test_scheduler.py tests/integration/test_evaluation_recovery.py
 git commit -m "feat: schedule idempotent quarter-hour evaluations"
 ```
@@ -1706,7 +1711,7 @@ def test_new_broker_session_advances_durable_epoch(receiver, paho, epoch_store) 
 
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_backoff.py tests/unit/test_mqtt_client.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_backoff.py tests/unit/test_mqtt_client.py -v`
 
 Expected: FAIL por adaptador ausente.
 
@@ -1775,17 +1780,17 @@ O receiver deve usar client ID estável, sessão persistente, `loop_start`, aute
 
 - [ ] **Step 4: Rodar testes unitários e integração Mosquitto**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_backoff.py tests/unit/test_mqtt_client.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_backoff.py tests/unit/test_mqtt_client.py -v`
 
 Expected: PASS.
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_mqtt_qos1_tls.py -v -m mosquitto --run-mosquitto`
+Run: `.venv/bin/python -m pytest tests/integration/test_mqtt_qos1_tls.py -v -m mosquitto --run-mosquitto`
 
 Expected: PASS quando `mosquitto.exe` estiver disponível. O teste força (a) falha/rollback antes do commit seguida de reentrega `DUP=1`, que deve produzir uma medição, e (b) commit bem-sucedido seguido de perda da conexão antes do PUBACK; neste segundo caso reconecta com o mesmo client ID/sessão e recebe o QoS 1 novamente. Deve haver duas linhas de auditoria em `raw_events` (a segunda `duplicate=1`), mas exatamente uma `measurement`, transição lógica, alarme e outbox, sem renovar `last_new_message_at_utc`. Um teste adicional encerra **o processo inteiro** após o commit de `prepare` e antes de `apply/ACK`, publica outra mensagem enquanto ele está parado e inicia um novo processo com o mesmo client ID. Deve receber `session_present=true`, reentregar e aplicar a primeira uma vez, entregar a mensagem enfileirada e confirmar os dois SUBACK. Também verifica retained e avanço do `mqtt_session_epoch` somente quando o broker devolve `session_present=false`.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/mqtt tests/unit/test_backoff.py tests/unit/test_mqtt_client.py tests/integration/test_mqtt_qos1_tls.py tests/fixtures/mosquitto.conf
 git commit -m "feat: receive MQTT safely with commit-before-ack"
 ```
@@ -1840,7 +1845,7 @@ def test_retry_delay_grows_and_caps_at_sixty_minutes() -> None:
 
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_email_templates.py tests/unit/test_outbox_policy.py tests/integration/test_outbox_smtp.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_email_templates.py tests/unit/test_outbox_policy.py tests/integration/test_outbox_smtp.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -1866,13 +1871,13 @@ class GmailSmtpTransport:
 
 - [ ] **Step 4: Rodar testes com SMTP fake**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_email_templates.py tests/unit/test_outbox_policy.py tests/integration/test_outbox_smtp.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_email_templates.py tests/unit/test_outbox_policy.py tests/integration/test_outbox_smtp.py -v`
 
 Expected: PASS, incluindo falha temporária, recuperação, lease expirado e fingerprint único.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/notifications tests/unit/test_email_templates.py tests/unit/test_outbox_policy.py tests/integration/test_outbox_smtp.py
 git commit -m "feat: deliver alarm emails through persistent outbox"
 ```
@@ -1914,7 +1919,7 @@ def test_json_logger_redacts_credentials_and_email(caplog, json_logger) -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_health_report.py tests/unit/test_logging_redaction.py tests/integration/test_daily_integrity.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_health_report.py tests/unit/test_logging_redaction.py tests/integration/test_daily_integrity.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -1929,17 +1934,17 @@ def integrity_fingerprint(local_date: date) -> str:
     return fingerprint("daily-integrity", local_date.isoformat(), "v1")
 ```
 
-O scheduler deve enfileirar uma integridade por data local na primeira execução em ou após 08:00, protegida por fingerprint UNIQUE. O e-mail deve declarar explicitamente conexão, idades, contagens e alarmes; ausência desse e-mail é o sinal externo de possível indisponibilidade. `RedactingJsonFormatter` aceita allowlist de chaves, converte e-mails e bearer tokens para `[REDACTED]` e usa `RotatingFileHandler`; Event Log recebe somente start/stop/fatal.
+O scheduler deve enfileirar uma integridade por data local na primeira execução em ou após 08:00, protegida por fingerprint UNIQUE. O e-mail deve declarar explicitamente conexão, idades, contagens e alarmes; ausência desse e-mail é o sinal externo de possível indisponibilidade. `RedactingJsonFormatter` aceita allowlist de chaves, converte e-mails e bearer tokens para `[REDACTED]` e escreve JSON em `stdout`/`stderr` para o `journald` (`SyslogIdentifier=mqtt-core`) e, em paralelo, usa `RotatingFileHandler` em `/var/log/agente-mqtt`; eventos de start/stop/fatal também vão ao `journald` com prioridade `NOTICE`/`CRIT` via prefixo `<5>`/`<2>`.
 
 - [ ] **Step 4: Executar testes de timezone, replay e redaction**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_health_report.py tests/unit/test_logging_redaction.py tests/integration/test_daily_integrity.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_health_report.py tests/unit/test_logging_redaction.py tests/integration/test_daily_integrity.py -v`
 
 Expected: PASS; duas execuções na mesma data local deixam uma única outbox.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/observability src/agente_mqtt/scheduling/scheduler.py tests/unit/test_health_report.py tests/unit/test_logging_redaction.py tests/integration/test_daily_integrity.py
 git commit -m "feat: report MQTT core integrity and health"
 ```
@@ -2003,7 +2008,7 @@ def test_daily_maintenance_runs_once_and_recovers_after_restart(maintenance_harn
 
 - [ ] **Step 2: Executar teste e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_retention_backup.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_retention_backup.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -2025,13 +2030,13 @@ def backup_database(source: Path, destination: Path) -> BackupResult:
 
 - [ ] **Step 4: Executar testes de integridade e retenção**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_retention_backup.py tests/integration/test_maintenance_schedule.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_retention_backup.py tests/integration/test_maintenance_schedule.py -v`
 
 Expected: PASS; banco de origem continua recebendo gravações durante backup.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/storage/retention.py src/agente_mqtt/storage/backup.py src/agente_mqtt/scheduling/maintenance.py src/agente_mqtt/application.py tests/integration/test_retention_backup.py tests/integration/test_maintenance_schedule.py
 git commit -m "feat: retain and back up operational history"
 ```
@@ -2085,7 +2090,7 @@ def test_app_exposes_fatal_signal_for_service_wrapper(fake_components) -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_application_lifecycle.py tests/integration/test_restart_idempotency.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_application_lifecycle.py tests/integration/test_restart_idempotency.py -v`
 
 Expected: FAIL pela ausência do composition root.
 
@@ -2122,132 +2127,278 @@ class MqttCoreApplication:
         self._writer.stop(remaining(deadline, self._clock))
 ```
 
-`__main__` deve aceitar somente `run --config ABSOLUTE_PATH` e `validate-config --config ABSOLUTE_PATH`. Config inválida falha antes de abrir rede; fatal de banco encerra com código 1 para o SCM reiniciar; erro Gmail não encerra aquisição. `_initialize_states_and_contract()` valida/grava manifesto e projeções com `ready=0`; `_publish_contract_ready()` só roda após `catch_up()` concluir e muda os dois flags para `1` na mesma transação. Se catch-up falhar ou ficar bloqueado, o Analyst nunca observa prontidão. Somente então iniciam dispatcher, loops e MQTT, impedindo transições históricas fora de ordem. Teste de reinício deve parar após cada fronteira transacional — inclusive entre os dois reservatórios e entre catch-up/ready — e confirmar reconstrução de estados, avaliações e outbox sem nova notificação lógica.
+`__main__` deve aceitar somente `run --config ABSOLUTE_PATH` e `validate-config --config ABSOLUTE_PATH`. Config inválida falha antes de abrir rede; fatal de banco encerra com código 1 para o `systemd` reiniciar (`Restart=always`); erro Gmail não encerra aquisição. `_initialize_states_and_contract()` valida/grava manifesto e projeções com `ready=0`; `_publish_contract_ready()` só roda após `catch_up()` concluir e muda os dois flags para `1` na mesma transação. Se catch-up falhar ou ficar bloqueado, o Analyst nunca observa prontidão. Somente então iniciam dispatcher, loops e MQTT, impedindo transições históricas fora de ordem. Teste de reinício deve parar após cada fronteira transacional — inclusive entre os dois reservatórios e entre catch-up/ready — e confirmar reconstrução de estados, avaliações e outbox sem nova notificação lógica.
 
 A aplicação observa os sinais fatais do writer e do receiver em uma thread de supervisão curta; o primeiro erro preserva a exceção original, seta `MqttCoreApplication.fatal_event` e inicia shutdown. Falha SMTP permanece não fatal e nunca seta esse evento.
 
 - [ ] **Step 4: Executar testes de lifecycle e a suíte completa**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_application_lifecycle.py tests/integration/test_restart_idempotency.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_application_lifecycle.py tests/integration/test_restart_idempotency.py -v`
 
 Expected: PASS.
 
-Run: `.venv\Scripts\python.exe -m pytest -q -m "not mosquitto and not soak and not operational and not live"`
+Run: `.venv/bin/python -m pytest -q -m "not mosquitto and not soak and not operational and not live"`
 
 Expected: todos os testes não operacionais PASS.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/agente_mqtt/application.py src/agente_mqtt/__main__.py tests/integration/test_application_lifecycle.py tests/integration/test_restart_idempotency.py
 git commit -m "feat: compose resilient MQTT core runtime"
 ```
 
-### Task 15: Serviço Windows, instalação e segurança operacional
+### Task 15: Serviço systemd, instalação e segurança operacional
 
 **Files:**
 - Create: `src/agente_mqtt/service/paths.py`
-- Create: `src/agente_mqtt/service/windows_service.py`
-- Create: `scripts/install-mqtt-core.ps1`
-- Create: `scripts/uninstall-mqtt-core.ps1`
-- Create: `scripts/configure-mqtt-core-recovery.ps1`
-- Create: `scripts/verify-mqtt-core.ps1`
-- Create: `tests/operational/test_windows_service.py`
+- Create: `src/agente_mqtt/service/systemd_notify.py`
+- Create: `src/agente_mqtt/service/linux_service.py`
+- Create: `deploy/systemd/mqtt-core.service`
+- Create: `deploy/agente-mqtt.tmpfiles.conf`
+- Create: `scripts/install-mqtt-core.sh`
+- Create: `scripts/uninstall-mqtt-core.sh`
+- Create: `scripts/verify-mqtt-core.sh`
+- Create: `tests/unit/test_systemd_notify.py`
+- Create: `tests/operational/test_linux_service.py`
 
 **Interfaces:**
-- Consumes: `MqttCoreApplication` e caminhos absolutos.
-- Produces: serviço `AgenteMqttCore`, delayed auto-start, recovery do SCM, Event Source e smoke test operacional.
+- Consumes: `MqttCoreApplication`, `SystemdCredentialProvider` e caminhos absolutos.
+- Produces: unidade `mqtt-core.service` (`Type=notify`, watchdog, reinício automático, endurecimento), usuário `agente-mqtt`, grupo `agente-mqtt-ro` para leitura analítica e smoke test operacional.
 
-- [ ] **Step 1: Escrever teste do wrapper sem instalar serviço**
+- [ ] **Step 1: Escrever testes do notificador e do runtime sem instalar serviço**
 
 ```python
-# tests/operational/test_windows_service.py
-import threading
-import pytest
-from agente_mqtt.service.windows_service import ServiceRuntime
+# tests/unit/test_systemd_notify.py
+import socket
+from agente_mqtt.service.systemd_notify import SystemdNotifier
 
-def test_service_stop_reports_pending_until_graceful_shutdown(fake_app, fake_scm) -> None:
-    runtime = ServiceRuntime(fake_app, fake_scm)
+def test_notifier_is_noop_without_notify_socket(monkeypatch) -> None:
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    assert SystemdNotifier.from_environment().notify("READY=1") is False
+
+def test_notifier_sends_datagram_to_socket(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "notify"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); server.bind(str(path))
+    monkeypatch.setenv("NOTIFY_SOCKET", str(path))
+    assert SystemdNotifier.from_environment().notify("READY=1\nSTATUS=catch-up complete") is True
+    assert server.recv(256) == b"READY=1\nSTATUS=catch-up complete"
+
+def test_watchdog_interval_is_half_of_watchdog_usec(monkeypatch) -> None:
+    monkeypatch.setenv("WATCHDOG_USEC", "60000000")
+    monkeypatch.setenv("WATCHDOG_PID", str(__import__("os").getpid()))
+    assert SystemdNotifier.from_environment().watchdog_interval_seconds() == 30.0
+```
+
+```python
+# tests/operational/test_linux_service.py
+import signal
+import pytest
+from agente_mqtt.service.linux_service import ServiceRuntime
+
+def test_ready_is_sent_only_after_application_start_and_catch_up(fake_app, fake_notifier) -> None:
+    runtime = ServiceRuntime(fake_app, fake_notifier)
+    runtime.start_in_thread()
+    fake_app.wait_started()
+    assert fake_notifier.messages[0].startswith("READY=1")
+    assert fake_app.catch_up_completed_before(fake_notifier.first_ready_at)
+
+def test_sigterm_sends_stopping_and_stops_with_30_second_deadline(fake_app, fake_notifier) -> None:
+    runtime = ServiceRuntime(fake_app, fake_notifier)
     fake_app.block_stop_for(seconds=8)
     runtime.start_in_thread()
-    runtime.stop()
+    runtime.handle_signal(signal.SIGTERM)
+    assert runtime.join(timeout=40) == 0
     assert fake_app.stop_calls == [30.0]
-    assert fake_scm.states[0] == "STOP_PENDING"
-    assert fake_scm.states[-1] == "STOPPED"
-    assert fake_scm.stop_pending_checkpoints_are_strictly_increasing()
-    assert fake_scm.maximum_checkpoint_gap_seconds < fake_scm.wait_hint_seconds
+    assert "STOPPING=1" in fake_notifier.messages
 
-def test_service_runtime_reports_failure_when_app_fatal_occurs(fake_app, fake_scm) -> None:
-    runtime = ServiceRuntime(fake_app, fake_scm)
+def test_watchdog_ping_stops_when_main_loop_is_unhealthy(fake_app, fake_notifier, fake_clock) -> None:
+    runtime = ServiceRuntime(fake_app, fake_notifier, clock=fake_clock)
+    runtime.start_in_thread()
+    fake_app.mark_main_loop_stalled()
+    fake_clock.advance(seconds=120)
+    assert fake_notifier.watchdog_pings_after(fake_app.stalled_at) == 0
+
+def test_runtime_exits_1_when_app_fatal_occurs(fake_app, fake_notifier) -> None:
+    runtime = ServiceRuntime(fake_app, fake_notifier)
     fake_app.signal_fatal(OSError("disk unavailable"))
     assert runtime.run_until_stop_or_fatal() == 1
-    assert fake_scm.service_specific_exit_code != 0
-    assert fake_scm.states[-1] == "STOPPED"
 
-def test_service_loads_installed_contract_when_cwd_is_system32(installed_service, monkeypatch) -> None:
-    monkeypatch.chdir(r"C:\Windows\System32")
+def test_service_loads_installed_contract_when_cwd_is_root(installed_service, monkeypatch) -> None:
+    monkeypatch.chdir("/")
     installed_service.start()
     assert installed_service.contract_path == installed_service.config.resource_directory / "contracts" / "operational_v1.json"
     assert installed_service.contract_hash_verified
 
 @pytest.mark.operational
-def test_scm_restarts_service_after_fatal_while_running(installed_service) -> None:
-    first_pid = installed_service.pid
+def test_systemd_restarts_service_after_fatal_while_running(installed_service) -> None:
+    first_pid = installed_service.main_pid()
     installed_service.inject_fatal_after_running(OSError("disk unavailable"))
-    assert installed_service.wait_for_new_running_pid(timeout=120) != first_pid
+    assert installed_service.wait_for_new_main_pid(timeout=60) != first_pid
 ```
 
-- [ ] **Step 2: Executar teste e confirmar a falha**
+- [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/operational/test_windows_service.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_systemd_notify.py tests/operational/test_linux_service.py -v`
 
-Expected: FAIL por wrapper ausente.
+Expected: FAIL por módulos ausentes.
 
-- [ ] **Step 3: Implementar `ServiceFramework` e scripts idempotentes**
+- [ ] **Step 3: Implementar notificador, runtime, unidade e scripts idempotentes**
 
 ```python
-# src/agente_mqtt/service/windows_service.py
-class AgenteMqttCoreService(win32serviceutil.ServiceFramework):
-    _svc_name_ = "AgenteMqttCore"
-    _svc_display_name_ = "Agente MQTT Core"
+# src/agente_mqtt/service/systemd_notify.py
+import os, socket
 
-    def SvcStop(self) -> None:
-        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING, waitHint=30000)
-        self._stop_event.set()
+class SystemdNotifier:
+    def __init__(self, address: str | None, watchdog_usec: int | None) -> None:
+        self._address, self._watchdog_usec = address, watchdog_usec
 
-    def SvcDoRun(self) -> None:
-        config_path = Path(win32serviceutil.GetServiceCustomOption(self._svc_name_, "ConfigPath"))
-        app = build_application(load_config(config_path), WindowsCredentialProvider(), SystemClock())
-        app.start()
-        outcome = wait_for_first(self._stop_event, app.fatal_event)
-        with PeriodicStopCheckpoint(self._report_stop_pending, interval_seconds=2.0):
-            app.stop(deadline_seconds=30.0)
-        if outcome is app.fatal_event:
-            self.ReportServiceStatus(
-                win32service.SERVICE_STOPPED,
-                win32ExitCode=win32service.ERROR_SERVICE_SPECIFIC_ERROR,
-                svcExitCode=1,
-            )
-            raise ServiceFatalError() from app.fatal_error
+    @classmethod
+    def from_environment(cls) -> "SystemdNotifier":
+        address = os.environ.get("NOTIFY_SOCKET")
+        usec = os.environ.get("WATCHDOG_USEC")
+        pid_ok = os.environ.get("WATCHDOG_PID") in (None, str(os.getpid()))
+        return cls(address, int(usec) if usec and pid_ok else None)
+
+    def notify(self, message: str) -> bool:
+        if not self._address:
+            return False
+        target = "\0" + self._address[1:] if self._address.startswith("@") else self._address
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as sock:
+            sock.sendto(message.encode("utf-8"), target)
+        return True
+
+    def watchdog_interval_seconds(self) -> float | None:
+        return None if self._watchdog_usec is None else self._watchdog_usec / 2_000_000
 ```
 
-O instalador deve exigir elevação, validar caminhos sob `C:\ProgramData\AgenteMQTT`, instalar usando o Python/venv absoluto acessível à conta de serviço, criar Event Source, configurar delayed auto-start, as ações de recovery e `FailureActionsOnNonCrashFailures=1`, mas não inserir credenciais. Resolve a fonte empacotada em `<venv-data>\share\agente-mqtt\contracts\operational_v1.json`, confere seu hash esperado e a copia via arquivo temporário + rename para `<resource_directory>\contracts\operational_v1.json`; aplica ACL de leitura à conta Core e aborta se a fonte/destino/hash não corresponder. O serviço jamais consulta `$PSScriptRoot`, repositório ou CWD em runtime. `PeriodicStopCheckpoint` usa thread/timer independente, inicia antes de `app.stop`, reporta `STOP_PENDING` a cada 2 segundos mesmo se um único componente bloquear, e sempre é encerrado no `finally`; callbacks após `STOPPED` são proibidos. Deve imprimir os nomes exatos das credenciais a provisionar. Aceita opcionalmente o SID da conta `StatisticalAnalyst`: concede somente Read+Traverse ao diretório do banco operacional e aos arquivos SQLite `operational.sqlite`, `-wal` e `-shm`; nunca concede Create/Write/Delete. Sem esse SID, imprime o comando exato que deverá ser executado antes da instalação analítica. O verificador confirma serviço, conta dedicada, ACLs, hash do recurso instalado, TLS, ausência de permissão MQTT publish por teste negativo, BitLocker e reinício real após fatal não-crash; falhar se qualquer pré-condição operacional não estiver comprovada.
+```python
+# src/agente_mqtt/service/linux_service.py
+def main(config_path: Path) -> int:
+    notifier = SystemdNotifier.from_environment()
+    app = build_application(load_config(config_path), SystemdCredentialProvider(), SystemClock())
+    runtime = ServiceRuntime(app, notifier)
+    signal.signal(signal.SIGTERM, runtime.handle_signal)
+    signal.signal(signal.SIGINT, runtime.handle_signal)
+    return runtime.run_until_stop_or_fatal()
 
-- [ ] **Step 4: Rodar teste unitário e smoke test em Windows elevado**
+class ServiceRuntime:
+    def run_until_stop_or_fatal(self) -> int:
+        self._app.start()                       # inclui catch_up e _publish_contract_ready
+        self._notifier.notify("READY=1\nSTATUS=monitoring")
+        self._watchdog.start()                  # ping somente se app.main_loop_healthy()
+        outcome = wait_for_first(self._stop_event, self._app.fatal_event)
+        self._notifier.notify("STOPPING=1")
+        try:
+            self._app.stop(deadline_seconds=30.0)
+        finally:
+            self._watchdog.stop()
+        return 1 if outcome is self._app.fatal_event else 0
+```
 
-Run: `.venv\Scripts\python.exe -m pytest tests/operational/test_windows_service.py -v --run-operational`
+O `__main__` passa a chamar `linux_service.main()` no subcomando `run`. O watchdog envia `WATCHDOG=1` a cada `watchdog_interval_seconds()`, mas só quando `app.main_loop_healthy()` for verdadeiro: writer vivo, scheduler com batimento recente e receptor MQTT sem deadlock. A desconexão do broker não é falha de watchdog, porque a reconexão é tratada pela aplicação.
+
+```ini
+# deploy/systemd/mqtt-core.service
+[Unit]
+Description=Agente MQTT Core (supervisorio, somente leitura)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=agente-mqtt
+Group=agente-mqtt
+WorkingDirectory=/
+ExecStartPre=/opt/agente-mqtt/venv/bin/python -m agente_mqtt validate-config --config /etc/agente-mqtt/mqtt-core.toml
+ExecStart=/opt/agente-mqtt/venv/bin/python -m agente_mqtt run --config /etc/agente-mqtt/mqtt-core.toml
+Restart=always
+RestartSec=5
+WatchdogSec=60
+TimeoutStartSec=300
+TimeoutStopSec=40
+KillMode=mixed
+LoadCredential=mqtt.username:/etc/credstore/agente-mqtt/mqtt.username
+LoadCredential=mqtt.password:/etc/credstore/agente-mqtt/mqtt.password
+LoadCredential=gmail.username:/etc/credstore/agente-mqtt/gmail.username
+LoadCredential=gmail.app_password:/etc/credstore/agente-mqtt/gmail.app_password
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/agente-mqtt /var/backups/agente-mqtt /var/log/agente-mqtt
+ReadOnlyPaths=/opt/agente-mqtt /etc/agente-mqtt
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`TimeoutStartSec=300` cobre o catch-up depois de uma parada longa. O `READY=1` só sai depois dele, então o Analyst nunca vê o sistema pronto antes da hora.
+
+`scripts/install-mqtt-core.sh` (`set -euo pipefail`, exige `root`, idempotente):
+
+- cria os usuários de sistema `agente-mqtt` (sem shell, `/usr/sbin/nologin`) e o grupo `agente-mqtt-ro`;
+- aplica `deploy/agente-mqtt.tmpfiles.conf` com `systemd-tmpfiles --create`, criando:
+  - `/var/lib/agente-mqtt` com dono `agente-mqtt:agente-mqtt-ro` e modo `2750`;
+  - `/var/backups/agente-mqtt` e `/var/log/agente-mqtt` com modo `0750`;
+- cria o venv em `/opt/agente-mqtt/venv` com `python3.12` absoluto e instala o wheel e os locks com `--require-hashes`;
+- resolve a fonte empacotada em `<venv>/share/agente-mqtt/contracts/operational_v1.json`, confere o hash esperado e copia por arquivo temporário + `mv` atômico para `<resource_directory>/contracts/operational_v1.json`, com dono `root` e modo `0644`. Aborta se fonte, destino ou hash não corresponderem;
+- copia o TOML para `/etc/agente-mqtt/mqtt-core.toml`, com dono `root:agente-mqtt` e modo `0640`, sem sobrescrever um arquivo existente sem `--force-config`;
+- instala a unidade em `/etc/systemd/system/`, roda `systemd-analyze verify`, `systemctl daemon-reload` e `systemctl enable mqtt-core.service`;
+- **não** cria nem lê credenciais. Imprime os quatro caminhos exatos em `/etc/credstore/agente-mqtt/` a serem provisionados (modo `0600`, dono `root`) e o comando `systemd-creds encrypt` opcional.
+
+Leitura pelo Analyst:
+
+- O `operational.sqlite` é criado com `UMask=0027` e herda o grupo `agente-mqtt-ro` (bit setgid no diretório). Assim, `operational.sqlite`, `-wal` e `-shm` ficam legíveis pelo grupo e graváveis só pelo dono.
+- Com `--analyst-user agente-analista`, o instalador adiciona esse usuário **somente** ao grupo `agente-mqtt-ro`, sem nenhuma permissão de escrita.
+- O `-shm` precisa ser legível pelo grupo para o modo WAL somente leitura. Esse ponto é verificado no teste do Analyst.
+
+O serviço jamais consulta o diretório do script, o repositório ou o CWD em runtime.
+
+`scripts/verify-mqtt-core.sh` confirma e falha se qualquer item não estiver comprovado:
+
+- unidade ativa, `User=agente-mqtt` e `systemd-analyze security mqtt-core.service` com exposição ≤ 3,0;
+- donos e modos dos diretórios;
+- hash do recurso instalado;
+- TLS com validação de hostname contra o broker;
+- ausência de permissão de *publish* MQTT, por teste negativo;
+- relógio sincronizado (`timedatectl show -p NTPSynchronized`);
+- saída SMTP liberada (conexão TLS a `smtp.gmail.com:587`);
+- volume de dados cifrado (LUKS via `lsblk -o NAME,TYPE,FSTYPE`) ou a flag `--accept-provider-encryption`, registrada na evidência;
+- reinício real após fatal, via `systemctl kill --signal=SIGKILL` e via fatal injetado, com novo `MainPID` em até 60 s.
+
+- [ ] **Step 4: Rodar testes e smoke test em VPS de homologação**
+
+Run: `.venv/bin/python -m pytest tests/unit/test_systemd_notify.py tests/operational/test_linux_service.py -v`
+
+Expected: PASS (o teste `operational` é pulado sem `--run-operational`).
+
+Run (como `root`, na VPS de homologação): `sudo .venv/bin/python -m pytest tests/operational/test_linux_service.py -v --run-operational`
 
 Expected: PASS.
 
-Run (PowerShell elevado, máquina de homologação): `powershell -ExecutionPolicy Bypass -File scripts/verify-mqtt-core.ps1 -ConfigPath C:\ProgramData\AgenteMQTT\config\mqtt-core.toml`
+Run (como `root`): `sudo scripts/verify-mqtt-core.sh --config /etc/agente-mqtt/mqtt-core.toml`
 
-Expected: saída `MQTT_CORE_PREFLIGHT_OK`; serviço inicia, para e reinicia sem perder banco/outbox.
+Expected: saída `MQTT_CORE_PREFLIGHT_OK`. O serviço inicia, para e reinicia sem perder banco nem outbox, e `journalctl -u mqtt-core -b` mostra `READY` depois do catch-up.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/agente_mqtt/service scripts tests/operational/test_windows_service.py
-git commit -m "feat: run MQTT core as hardened Windows service"
+```bash
+git add src/agente_mqtt/service deploy scripts tests/unit/test_systemd_notify.py tests/operational/test_linux_service.py
+git commit -m "feat: run MQTT core as hardened systemd service"
 ```
 
 ### Task 16: Gates de aceitação e runbook do piloto
@@ -2306,29 +2457,40 @@ def test_acceptance_recovery_hysteresis_and_nonactivity_messages(harness) -> Non
 
 - [ ] **Step 2: Executar a suite completa com cobertura**
 
-Run: `.venv\Scripts\python.exe -m pytest -m "not mosquitto and not soak and not operational and not live" --cov=agente_mqtt --cov-report=term-missing --cov-fail-under=90`
+Run: `.venv/bin/python -m pytest -m "not mosquitto and not soak and not operational and not live" --cov=agente_mqtt --cov-report=term-missing --cov-fail-under=90`
 
 Expected: PASS e cobertura total pelo menos 90%; módulos `domain/*` pelo menos 95% via relatório.
 
 - [ ] **Step 3: Escrever runbooks com comandos concretos**
 
-O runbook de instalação deve conter: instalar CPython 3.12 x64; criar venv em `C:\Program Files\AgenteMQTT\venv`; instalar o wheel/locks; confirmar migration empacotada; copiar e verificar o manifesto para o `resource_directory` absoluto; copiar TOML; provisionar quatro alvos de credencial (`mqtt.username`, `mqtt.password`, `gmail.username`, `gmail.app_password`) na conta do serviço; executar install/recovery/verify a partir de um CWD fora do repositório; consultar Event Log; rollback por uninstall preservando `C:\ProgramData\AgenteMQTT\data` e os recursos versionados da versão anterior.
+O runbook de instalação deve conter:
 
-O runbook do piloto deve conter: confirmação de ACL subscribe-only; teste de cada estado; desligamento/reconexão do broker; falha Gmail; reinício Windows; verificação de integridade 08:00; backup/restore; soak de 24 horas; formulário de evidência e critério de aprovação 9/9 da especificação.
+- preparar a VPS: Ubuntu 24.04 LTS atualizado; `ufw default deny incoming` liberando só SSH; SSH só com chave; `unattended-upgrades`; `timedatectl set-ntp true`; fuso do sistema em UTC;
+- instalar `python3.12` e `python3.12-venv`;
+- clonar o repositório em um diretório do usuário humano, nunca em `/opt`;
+- executar `sudo scripts/install-mqtt-core.sh` a partir de um CWD fora do repositório;
+- confirmar a migration empacotada e o manifesto no `resource_directory` absoluto;
+- provisionar as quatro credenciais em `/etc/credstore/agente-mqtt/` (`mqtt.username`, `mqtt.password`, `gmail.username`, `gmail.app_password`) com `install -m 0600 -o root`, sem deixar rastro no histórico do shell (`read -rs`);
+- `sudo systemctl start mqtt-core` e `sudo scripts/verify-mqtt-core.sh`;
+- consultar `journalctl -u mqtt-core`;
+- configurar o backup externo cifrado (por exemplo, um timer `restic` diário sobre `/var/backups/agente-mqtt`);
+- rollback: `sudo scripts/uninstall-mqtt-core.sh` preserva `/var/lib/agente-mqtt`, os backups e os recursos versionados da versão anterior em `/opt/agente-mqtt/releases/<versão>`.
 
-- [ ] **Step 4: Executar soak opt-in e checklist Windows**
+O runbook do piloto deve conter: confirmação de ACL subscribe-only; teste de cada estado; desligamento/reconexão do broker; falha Gmail; bloqueio da saída SMTP pelo provedor; reinício da VPS (`sudo reboot`) com retomada automática; verificação de integridade 08:00; backup/restore a partir da cópia externa com `PRAGMA integrity_check`; soak de 24 horas; formulário de evidência e critério de aprovação 9/9 da especificação.
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_core_24h_soak.py -m soak --run-soak --mqtt-host localhost --duration-hours 24`
+- [ ] **Step 4: Executar soak opt-in e checklist da VPS**
+
+Run: `.venv/bin/python -m pytest tests/integration/test_core_24h_soak.py -m soak --run-soak --mqtt-host localhost --duration-hours 24`
 
 Expected: 100% das mensagens publicadas nos dois tópicos presentes em `raw_events`, nenhuma notificação lógica duplicada, avaliações completas e nenhuma thread fatal.
 
-Run: `powershell -ExecutionPolicy Bypass -File scripts/verify-mqtt-core.ps1 -ConfigPath C:\ProgramData\AgenteMQTT\config\mqtt-core.toml -RunAlarmMatrix`
+Run: `sudo scripts/verify-mqtt-core.sh --config /etc/agente-mqtt/mqtt-core.toml --run-alarm-matrix`
 
 Expected: `MQTT_CORE_ACCEPTANCE_OK` e arquivo de evidência sem segredos.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add tests/conftest.py tests/integration/test_acceptance_scenarios.py tests/integration/test_core_24h_soak.py docs/runbooks config/mqtt-core.example.toml
 git commit -m "test: gate MQTT core operational pilot"
 ```
@@ -2337,11 +2499,11 @@ git commit -m "test: gate MQTT core operational pilot"
 
 Executar, nesta ordem:
 
-```powershell
-.venv\Scripts\python.exe -m pytest -m "not mosquitto and not soak and not operational and not live" --cov=agente_mqtt --cov-report=term-missing --cov-fail-under=90
-.venv\Scripts\python.exe -m compileall -q src tests
+```bash
+.venv/bin/python -m pytest -m "not mosquitto and not soak and not operational and not live" --cov=agente_mqtt --cov-report=term-missing --cov-fail-under=90
+.venv/bin/python -m compileall -q src tests
 git diff --check
-powershell -ExecutionPolicy Bypass -File scripts/verify-mqtt-core.ps1 -ConfigPath C:\ProgramData\AgenteMQTT\config\mqtt-core.toml -RunAlarmMatrix
+sudo scripts/verify-mqtt-core.sh --config /etc/agente-mqtt/mqtt-core.toml --run-alarm-matrix
 ```
 
 Critério: comandos com exit code 0, suíte sem falhas, preflight operacional aprovado e nenhuma alteração do Statistical Analyst neste plano.

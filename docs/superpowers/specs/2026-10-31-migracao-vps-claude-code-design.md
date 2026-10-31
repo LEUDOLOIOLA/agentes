@@ -7,7 +7,7 @@
   - `2026-08-10-openai-analista-estatistico-design.md` (analista estatístico)
 - Planos afetados:
   - `../plans/2026-08-12-mqtt-core-implementation-plan.md`
-  - `../plans/2026-08-12-statistical-analyst-openai-implementation-plan.md`
+  - `../plans/2026-08-12-statistical-analyst-claude-implementation-plan.md` (antigo `...-openai-...`, renomeado e reescrito)
 - Natureza: mudança de plataforma e de provedor da camada consultiva; regras de domínio inalteradas
 
 ## 1. Decisões confirmadas
@@ -85,13 +85,15 @@ Diretórios, que substituem os caminhos `C:\ProgramData\AgenteMQTT\...`:
 - Endurecimento: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `ReadWritePaths=/var/lib/agente-mqtt /var/log/agente-mqtt`, `LoadCredential=` para os segredos MQTT e SMTP.
 - `Nice=0`, com prioridade de E/S normal.
 
-`statistical-analyst.service` e `statistical-analyst.timer`:
+`statistical-analyst.service`:
 
-- O timer substitui o agendador interno: `OnCalendar=*-*-* 00/4:02:00 America/Fortaleza`, com `Persistent=true`. Os dois minutos de atraso já estão previstos na seção 4.1 da especificação do analista.
-- `Type=oneshot`, com `TimeoutStartSec=180`, que é o prazo total de 3 minutos.
-- `Nice=10`, `IOSchedulingClass=idle` e `CPUWeight=20`, que equivalem ao `BELOW_NORMAL` do Windows.
-- `ReadOnlyPaths=/var/lib/agente-mqtt` e `ReadWritePaths=/var/lib/agente-analista`.
-- A idempotência por `(window_end, analysis_version)` continua no banco. O timer apenas dispara.
+- Serviço **contínuo** (`Type=notify`, `WatchdogSec=300`, `Restart=on-failure`). O agendador interno de 4 horas (fronteira + 2 minutos, com recomposição de janelas perdidas) e o dispatcher Gmail, que reenvia por até 60 minutos, ficam no processo. Um timer oneshot foi descartado na revisão dos planos porque encerraria o processo com retries de e-mail pendentes.
+- O prazo de 3 minutos por execução continua sendo imposto pelo coordenador.
+- `Requires=mqtt-core.service` e `After=mqtt-core.service`.
+- `Nice=10`, `IOSchedulingClass=idle` e `CPUWeight=20`, que equivalem ao `BELOW_NORMAL` do Windows; `MemoryMax=1G`.
+- `ReadOnlyPaths=/var/lib/agente-mqtt` e `ReadWritePaths=/var/lib/agente-analista`. A leitura vem do grupo `agente-mqtt-ro`.
+- `KillMode=control-group`, para que nenhum processo `claude` sobreviva ao stop.
+- Sem `MemoryDenyWriteExecute`, porque o Node.js do Claude Code precisa de JIT.
 
 ### 3.4 Segredos
 
@@ -197,6 +199,8 @@ A seção 13 do analista é reescrita para a Anthropic:
 
 ## 6. Impacto nos planos de implementação
 
+Status: aplicado nos dois planos em 2026-10-31.
+
 ### 6.1 MQTT Core
 
 | Item do plano | Mudança |
@@ -216,10 +220,10 @@ A seção 13 do analista é reescrita para a Anthropic:
 |---|---|
 | Tech stack | remover `openai` e `pywin32`; adicionar o Claude Code CLI (versão fixada no script de instalação) |
 | Cliente OpenAI | substituir por `ClaudeCodeClient` (subprocesso da seção 4.2) atrás da mesma interface, para que o validador e o fallback não mudem |
-| Agendador interno | substituído por `statistical-analyst.timer`; a lógica de recomposição/idempotência continua no código |
+| Agendador interno | mantido no processo contínuo (ver 3.3); só a gerência do processo passa ao `systemd` |
 | Contabilidade de tokens | adaptar para `usage` e `total_cost_usd` do Claude Code |
 | Fixtures/testes do contrato | trocar respostas simuladas da Responses API por saídas JSON simuladas do `claude -p`; incluir casos de `is_error`, timeout, código de saída ≠ 0 e JSON fora do schema |
-| Nome do plano | renomear para "Statistical Analyst Claude Implementation Plan" quando for reescrito |
+| Nome do plano | renomeado para `2026-08-12-statistical-analyst-claude-implementation-plan.md` |
 
 ## 7. Dados obrigatórios de implantação (novos ou alterados)
 

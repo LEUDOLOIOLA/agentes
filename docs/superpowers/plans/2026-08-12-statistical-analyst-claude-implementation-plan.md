@@ -1,34 +1,38 @@
-# Statistical Analyst OpenAI Implementation Plan
+# Statistical Analyst Claude Implementation Plan
 
-> **Atenção (2026-10-31):** a plataforma mudou de Windows para VPS Linux com systemd, e a camada consultiva passou a usar Claude Code headless. Antes de executar, aplique a seção 6 de `../specs/2026-10-31-migracao-vps-claude-code-design.md`.
+> **Revisão 2026-10-31:** plano reescrito para VPS Linux com `systemd` e para Claude Code headless (`claude -p`) no lugar da OpenAI Responses API, conforme `../specs/2026-10-31-migracao-vps-claude-code-design.md`. Estatística, selagem, validação, fallback e relatório seguem a especificação de 2026-08-10, trocando o provedor.
 
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Construir um segundo serviço Windows que, a cada 4 horas, calcula estatísticas locais independentes dos reservatórios `0051` e `0022`, solicita interpretação estruturada ao `gpt-5.6-luna` e entrega um único relatório consultivo pelo Gmail com fallback determinístico.
+**Goal:** Construir um segundo serviço `systemd`, na mesma VPS Linux do Core, que a cada 4 horas calcula estatísticas locais independentes dos reservatórios `0051` e `0022`, solicita interpretação estruturada ao modelo Claude fixo via Claude Code headless e entrega um único relatório consultivo pelo Gmail com fallback determinístico.
 
-**Architecture:** `statistical_analyst` abre `operational.sqlite` somente para leitura e captura um snapshot consistente sem compartilhar workers, locks ou outbox com o MQTT Core. Métricas, suficiência, prioridade e alarmes são locais; duas chamadas OpenAI independentes interpretam pacotes selados, e um validador estrito rejeita qualquer saída incompleta, sem evidência ou com linguagem de controle. Estado analítico, orçamento, circuit breaker, relatórios e outbox residem em `analytics.sqlite` próprio.
+**Architecture:** `statistical_analyst` abre `operational.sqlite` somente para leitura e captura um snapshot consistente sem compartilhar workers, locks ou outbox com o MQTT Core. Métricas, suficiência, prioridade e alarmes são locais; dois subprocessos `claude -p` independentes, sem ferramentas, interpretam pacotes selados, e um validador estrito rejeita qualquer saída incompleta, sem evidência ou com linguagem de controle. Estado analítico, orçamento, circuit breaker, relatórios e outbox residem em `analytics.sqlite` próprio.
 
-**Tech Stack:** CPython 3.12 x64, biblioteca padrão, `openai==3.0.0`, `pydantic==2.13.4`, `pywin32==312`, `tzdata==2026.3`, `pytest==9.1.1`, `pytest-cov==7.1.0`, `pytest-asyncio==1.4.0`.
+**Tech Stack:** CPython 3.12, biblioteca padrão (`asyncio.subprocess`), Claude Code CLI em versão fixada (instalado em `/opt/claude-code`, autoatualização desligada), `pydantic==2.13.4`, `tzdata==2026.3`, `pytest==9.1.1`, `pytest-cov==7.1.0`, `pytest-asyncio==1.4.0`.
 
 ## Global Constraints
 
 - Pré-requisito: concluir o plano `2026-08-12-mqtt-core-implementation-plan.md`; este serviço consome o contrato SQL criado ali e nunca migra `operational.sqlite`.
-- Processo, conta Windows, prioridade, banco, writer, outbox, dispatcher Gmail e logs são distintos do MQTT Core.
-- Modelo fixo `gpt-5.6-luna`, Responses API, reasoning `low`, `store=false`, background desabilitado, truncation desabilitada, sem tools, memória ou `previous_response_id`.
+- Processo, usuário Linux (`agente-analista`), unidade `systemd`, prioridade (`Nice=10`, `IOSchedulingClass=idle`, `CPUWeight=20`), banco, writer, outbox, dispatcher Gmail e logs são distintos do MQTT Core.
+- O serviço é contínuo (`Type=notify`): o agendador interno de 4 horas e o dispatcher Gmail com retry de até 60 minutos continuam no processo. Não se usa timer oneshot, porque ele interromperia retries pendentes.
+- Modelo fixo `claude-sonnet-5-5` via `claude -p --model claude-sonnet-5-5 --effort low --output-format json --json-schema <schema> --system-prompt-file <prompt> --tools "" --strict-mcp-config --setting-sources "" --disable-slash-commands --no-session-persistence --max-budget-usd <limite>`. Proibidos: `--fallback-model`, `--resume`/`--continue`, `--mcp-config`, `--add-dir`, `--allowedTools`, `--dangerously-skip-permissions`.
+- Subprocesso com CWD vazio (`/var/lib/agente-analista/claude-empty`), `HOME` dedicado, ambiente mínimo (`PATH`, `HOME`, credencial, `DISABLE_AUTOUPDATER=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS=4000`), pacote enviado por `stdin`, grupo de processos próprio e morto em timeout.
+- Versão do CLI fixada em configuração e conferida por `claude --version` no preflight; divergência impede chamadas e gera fallback até nova homologação.
 - Horários: `00:00`, `04:00`, `08:00`, `12:00`, `16:00`, `20:00` em `America/Fortaleza`; snapshot começa em `window_end + 2 minutos`.
 - Uma execução analítica global ativa; deadline total de 3 minutos, `busy_timeout=2s`, leitura operacional total de no máximo 10 segundos.
-- Um pacote selado por reservatório e janela; bytes canônicos, hash e manifesto persistidos antes de qualquer HTTP.
+- Um pacote selado por reservatório e janela; bytes canônicos, hash e manifesto persistidos antes de qualquer subprocesso Claude.
 - Janela atual `[end-4h,end)`, referência não sobreposta `[end-28h,end-4h)` e sete janelas de 4 horas no mesmo horário local dos dias anteriores.
 - Estatísticas, tendência, ETA, variabilidade, status, confiança, prioridade, alarmes e números do e-mail são calculados localmente.
 - Duas chamadas independentes, concorrência máxima 2; falha de uma afeta somente a seção correspondente.
-- Payload completo máximo 16.000 bytes UTF-8 e fixtures verificadas em até 5.000 tokens de entrada; `max_output_tokens=4000`; JSON visível máximo 6.000 bytes.
-- Máximo 24 tentativas, 120.000 tokens de entrada reservados e 96.000 de saída em qualquer janela móvel de 24 horas.
-- Uma repetição por reservatório somente para rede, 408, 409, 5xx ou 429 temporário; cada tentativa física exige nova reserva.
-- `incomplete`, refusal, erro semântico, schema inválido ou conteúdo inesperado sempre geram fallback e nunca retry semântico.
+- Payload completo (prompt de sistema + pacote + schema) máximo 16.000 bytes UTF-8, e fixtures verificadas em até 5.000 tokens de entrada **efetivos** medidos pelo `usage` do próprio `claude -p`, somando `input_tokens`, `cache_creation_input_tokens` e `cache_read_input_tokens`. Saída limitada por `CLAUDE_CODE_MAX_OUTPUT_TOKENS=4000`; JSON estruturado máximo 6.000 bytes.
+- Máximo 24 tentativas, 120.000 tokens de entrada reservados, 96.000 de saída e o orçamento diário em USD (`daily_budget_usd`) em qualquer janela móvel de 24 horas. `--max-budget-usd` por chamada é uma segunda barreira, não a principal.
+- Uma repetição por reservatório somente para falhas transitórias classificadas por allowlist versionada: timeout do subprocesso, erro de rede, sobrecarga/5xx/529 e rate limit temporário. Cada tentativa física exige nova reserva.
+- `is_error=true`, `subtype` diferente de `success`, ausência de `structured_output`, uso de qualquer ferramenta, modelo diferente do fixo em `modelUsage`, erro semântico, schema inválido ou conteúdo inesperado sempre geram fallback e nunca retry semântico.
 - Narrativa livre não pode conter algarismos; action codes vêm de catálogo fechado; a LLM nunca escolhe urgência, destinatários, assunto ou cadência.
-- Retenção analítica de 90 dias; segredos fora do repositório; logs guardam hashes, métricas e request IDs, nunca prompts, respostas, e-mails ou authorization headers.
-- Contrato, prompt e catálogo são instalados em diretório absoluto versionado; nenhum loader depende do current working directory do serviço Windows.
+- Retenção analítica de 90 dias. Segredos só via `systemd` `LoadCredential=` (`claude.credential`, `gmail.username`, `gmail.app_password`), nunca em TOML, Git, argumento de linha de comando ou log. Logs guardam hashes, métricas, `session_id` e custo, nunca prompts, respostas, e-mails, `stderr` bruto do CLI ou credenciais.
+- Credencial do Claude: `ANTHROPIC_API_KEY` de workspace dedicado (produção recomendada) ou `CLAUDE_CODE_OAUTH_TOKEN` de `claude setup-token` (piloto, se os termos do plano permitirem). O tipo é declarado em `claude_credential_kind` e vira a única variável de credencial passada ao subprocesso.
+- Contrato, prompt e catálogo são instalados em diretório absoluto versionado (`/opt/agente-mqtt/resources/statistical-analyst`); nenhum loader depende do current working directory.
 - Cada tarefa segue TDD e termina em commit próprio.
 
 ## Mapa de arquivos
@@ -40,10 +44,12 @@ resources/
   contracts/operational_v1.json  # criado pelo plano Core; somente consumido aqui
   prompts/statistical_analyst_v1.txt
   catalogs/action_codes_v1.json
+deploy/systemd/
+  statistical-analyst.service
 scripts/
-  install-statistical-analyst.ps1
-  uninstall-statistical-analyst.ps1
-  verify-statistical-analyst.ps1
+  install-statistical-analyst.sh
+  uninstall-statistical-analyst.sh
+  verify-statistical-analyst.sh
 src/statistical_analyst/
   __init__.py
   __main__.py
@@ -57,7 +63,7 @@ src/statistical_analyst/
   domain/
     operational.py
     analysis.py
-    openai_contract.py
+    claude_contract.py
     report.py
   persistence/
     migrations/0001_analytics.sql
@@ -82,7 +88,8 @@ src/statistical_analyst/
     response_validator.py
     retry_policy.py
     circuit_breaker.py
-    openai_client.py
+    claude_client.py
+    cli_envelope.py
   reporting/
     fallback.py
     renderer.py
@@ -93,7 +100,7 @@ src/statistical_analyst/
     evaluator.py
   service/
     runtime.py
-    windows_service.py
+    linux_service.py
 tests/
   unit/
   integration/
@@ -135,11 +142,11 @@ class UsageBudget(Protocol):
 class SecretProvider(Protocol):
     def get_required(self, target_name: str) -> str: ...
 
-class OpenAITransport(Protocol):
-    async def analyze(self, prepared: "PreparedOpenAIRequest", client_request_id: UUID) -> "ResponseEnvelope": ...
+class ClaudeTransport(Protocol):
+    async def analyze(self, prepared: "PreparedClaudeRequest", client_request_id: UUID) -> "CliEnvelope": ...
 
 class ResponseValidator(Protocol):
-    def validate(self, envelope: "ResponseEnvelope", sealed: "SealedInput") -> "ValidatedInterpretation | ValidationFailure": ...
+    def validate(self, envelope: "CliEnvelope", sealed: "SealedInput") -> "ValidatedInterpretation | ValidationFailure": ...
 
 class ReportOutbox(Protocol):
     def enqueue(self, report: "RenderedReport") -> None: ...
@@ -188,10 +195,18 @@ def test_config_requires_distinct_absolute_databases(tmp_path) -> None:
     assert cfg.analytics_database.is_absolute()
     assert cfg.resource_directory.is_absolute()
     assert cfg.operational_database != cfg.analytics_database
-    assert cfg.model == "gpt-5.6-luna"
-    assert cfg.openai_credential_name == "AgenteMQTT/StatisticalAnalyst/OpenAI"
+    assert cfg.model == "claude-sonnet-5-5"
+    assert cfg.claude_credential_name == "claude.credential"
+    assert cfg.claude_credential_kind in {"api_key", "oauth_token"}
+    assert cfg.claude_cli_path.is_absolute()
 
-def test_config_rejects_recipient_inside_openai_payload_fields(tmp_path) -> None:
+def test_config_rejects_fallback_model_and_unpinned_cli(tmp_path) -> None:
+    with pytest.raises(ConfigError, match="fallback"):
+        load_analyst_config(write_config(tmp_path, fallback_model="claude-haiku-5-5"))
+    with pytest.raises(ConfigError, match="claude_cli_version"):
+        load_analyst_config(write_config(tmp_path, claude_cli_version="latest"))
+
+def test_config_rejects_recipient_inside_claude_payload_fields(tmp_path) -> None:
     path = write_config(tmp_path, payload_fields=["reservoir_id", "gmail_recipients"])
     with pytest.raises(ConfigError, match="allowlist"):
         load_analyst_config(path)
@@ -202,17 +217,24 @@ def test_window_key_rejects_naive_datetime() -> None:
         WindowKey(datetime(2026, 8, 12), "analysis-v1")
 
 # tests/unit/test_analyst_secrets.py
-def test_windows_provider_reads_current_value_on_every_request(fake_credential_backend) -> None:
-    provider = WindowsCredentialProvider(fake_credential_backend)
-    fake_credential_backend.set("AgenteMQTT/StatisticalAnalyst/OpenAI", "first")
-    assert provider.get_required("AgenteMQTT/StatisticalAnalyst/OpenAI") == "first"
-    fake_credential_backend.set("AgenteMQTT/StatisticalAnalyst/OpenAI", "rotated")
-    assert provider.get_required("AgenteMQTT/StatisticalAnalyst/OpenAI") == "rotated"
+def test_systemd_provider_reads_current_file_on_every_request(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
+    provider = SystemdCredentialProvider()
+    (tmp_path / "claude.credential").write_text("first\n")
+    assert provider.get_required("claude.credential") == "first"
+    (tmp_path / "claude.credential").write_text("rotated\n")
+    assert provider.get_required("claude.credential") == "rotated"
+
+@pytest.mark.parametrize("name", ["../etc/passwd", "a/b", ""])
+def test_systemd_provider_rejects_unsafe_names(tmp_path, monkeypatch, name) -> None:
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
+    with pytest.raises(ConfigError):
+        SystemdCredentialProvider().get_required(name)
 ```
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_config.py tests/unit/test_analyst_secrets.py tests/unit/test_analysis_models.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_config.py tests/unit/test_analyst_secrets.py tests/unit/test_analysis_models.py -v`
 
 Expected: FAIL porque o pacote não existe.
 
@@ -221,23 +243,23 @@ Expected: FAIL porque o pacote não existe.
 ```toml
 # modificar as tabelas existentes em pyproject.toml; não redeclarar cabeçalhos TOML
 [project.optional-dependencies]
-analytics = ["openai==3.0.0", "pydantic==2.13.4"]
+analytics = ["pydantic==2.13.4"]
 test = ["pytest==9.1.1", "pytest-cov==7.1.0", "pytest-asyncio==1.4.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
-markers = ["live: calls a paid external API", "operational: requires Windows service privileges", "mosquitto: requires local Mosquitto", "soak: long-running operational test"]
+markers = ["live: calls a paid external API", "operational: requires root on a systemd host", "mosquitto: requires local Mosquitto", "soak: long-running operational test"]
 ```
 
 Ao editar, preservar `testpaths` e `addopts` criados pelo Core, adicionar `pytest-asyncio` à lista `test` existente e criar a chave `analytics`; um teste de parsing com `tomllib` deve assegurar que o arquivo final contém uma única tabela de cada nome.
 
 Atualizar os lockfiles existentes com hashes de todas as dependências transitivas e reinstalar no mesmo ambiente isolado criado pelo plano Core:
 
-```powershell
-.venv\Scripts\python.exe -m pip install --require-hashes -r requirements/production.lock
-.venv\Scripts\python.exe -m pip install --require-hashes -r requirements/test.lock
-.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .
-.venv\Scripts\python.exe -m pip check
+```bash
+.venv/bin/python -m pip install --require-hashes -r requirements/production.lock
+.venv/bin/python -m pip install --require-hashes -r requirements/test.lock
+.venv/bin/python -m pip install --no-build-isolation --no-deps -e .
+.venv/bin/python -m pip check
 ```
 
 ```python
@@ -253,21 +275,21 @@ class WindowKey:
 ReservoirId: TypeAlias = Literal["0051", "0022"]
 ```
 
-O TOML deve conter caminhos absolutos separados, `resource_directory=C:\\ProgramData\\AgenteMQTT\\StatisticalAnalyst\\resources`, timezone, modelo fixo, horários, snapshot delay, deadlines, limites, Gmail e nomes de targets do Windows Credential Manager (`openai_credential_name` e `gmail_credential_name`); nenhum segredo. Rejeitar chaves extras, modelo divergente, banco inexistente no preflight e diretórios graváveis compartilhados com o Core, exceto leitura do arquivo operacional. `WindowsCredentialProvider` chama `win32cred.CredRead` sob a identidade corrente em toda solicitação, decodifica somente `CRED_TYPE_GENERIC`, devolve erro seguro para target ausente e nunca faz cache/log do valor; isso permite rotação sem reiniciar e é reutilizado por OpenAI e Gmail.
+O TOML deve conter caminhos absolutos separados (`operational_database=/var/lib/agente-mqtt/operational.sqlite`, `analytics_database=/var/lib/agente-analista/analytics.sqlite`, `resource_directory=/opt/agente-mqtt/resources/statistical-analyst`, `claude_cli_path=/opt/claude-code/bin/claude`, `claude_workdir=/var/lib/agente-analista/claude-empty`, `claude_home=/var/lib/agente-analista/claude-home`), `claude_cli_version` exata, `claude_credential_kind`, `max_budget_usd_per_call`, `daily_budget_usd`, timezone, modelo fixo, horários, snapshot delay, deadlines, limites, Gmail e nomes das credenciais `systemd` (`claude_credential_name` e `gmail_credential_name`); nenhum segredo. Rejeitar chaves extras, modelo divergente, banco inexistente no preflight e diretórios graváveis compartilhados com o Core, exceto leitura do arquivo operacional. Rejeitar também `fallback_model`, `claude_cli_version` sem versão exata e `claude_workdir` não vazio ou dentro de um repositório. `SystemdCredentialProvider` lê `$CREDENTIALS_DIRECTORY/<nome>` em toda solicitação, remove só o `\n` final, rejeita nome com `/` ou `..`, link simbólico e arquivo vazio, devolve erro seguro sem conteúdo e nunca faz cache/log do valor. Ele é reutilizado pelo cliente Claude e pelo Gmail. Rotação: atualizar `/etc/credstore/agente-analista/<nome>` e `systemctl restart statistical-analyst`, porque o `systemd` só recopia credenciais na partida; a leitura sem cache garante que nenhum valor antigo sobreviva no processo.
 
 - [ ] **Step 4: Executar testes e checar import das versões fixadas**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_config.py tests/unit/test_analyst_secrets.py tests/unit/test_analysis_models.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_config.py tests/unit/test_analyst_secrets.py tests/unit/test_analysis_models.py -v`
 
 Expected: PASS.
 
-Run: `.venv\Scripts\python.exe -c "import openai,pydantic; assert openai.__version__=='3.0.0'; assert pydantic.__version__=='2.13.4'"`
+Run: `.venv/bin/python -c "import pydantic; assert pydantic.__version__=='2.13.4'"`
 
 Expected: exit code 0 no ambiente instalado pelos locks.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add pyproject.toml requirements config/statistical-analyst.example.toml src/statistical_analyst tests/unit/test_analyst_config.py tests/unit/test_analyst_secrets.py tests/unit/test_analysis_models.py
 git commit -m "build: scaffold statistical analyst service"
 ```
@@ -321,7 +343,7 @@ def test_isolated_wheel_can_create_analytics_database(isolated_wheel_install) ->
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_analytics_schema.py tests/integration/test_analysis_store.py tests/integration/test_analyst_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_analytics_schema.py tests/integration/test_analysis_store.py tests/integration/test_analyst_wheel_artifact.py -v`
 
 Expected: FAIL por persistência ausente.
 
@@ -382,13 +404,13 @@ Adicionar respostas, usage (incluindo `full_request_bytes`), report global por b
 
 - [ ] **Step 4: Executar testes de migração, concorrência e rollback**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_analytics_schema.py tests/integration/test_analysis_store.py tests/integration/test_analyst_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_analytics_schema.py tests/integration/test_analysis_store.py tests/integration/test_analyst_wheel_artifact.py -v`
 
 Expected: PASS, inclusive dois criadores concorrentes obtendo o mesmo batch e wheel isolado capaz de migrar sem source tree.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add pyproject.toml src/statistical_analyst/persistence tests/integration/test_analytics_schema.py tests/integration/test_analysis_store.py tests/integration/test_analyst_wheel_artifact.py
 git commit -m "feat: persist isolated analytics execution state"
 ```
@@ -396,7 +418,7 @@ git commit -m "feat: persist isolated analytics execution state"
 ### Task 3: Leitor read-only e snapshot operacional consistente
 
 **Files:**
-- Consume installed copy: `<resource_directory>\contracts\operational_v1.json`
+- Consume installed copy: `<resource_directory>/contracts/operational_v1.json`
 - Create: `src/statistical_analyst/persistence/operational_reader.py`
 - Create: `tests/integration/test_operational_snapshot.py`
 - Create: `tests/integration/test_operational_query_deadline.py`
@@ -459,7 +481,7 @@ def test_reader_uses_canonical_half_open_timestamp_bounds(operational_db, window
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_operational_snapshot.py tests/integration/test_operational_query_deadline.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_operational_snapshot.py tests/integration/test_operational_query_deadline.py -v`
 
 Expected: FAIL por reader ausente.
 
@@ -491,7 +513,7 @@ def capture(self, key: WindowKey, *, deadline_monotonic: float) -> OperationalSn
     return OperationalSnapshot.from_rows(rows, manifest)
 ```
 
-Antes de ler dados, comparar versão, `ready=1`, `timestamp_format`, `rule_version`, SHA-256 e a matriz exata de colunas obtida por `PRAGMA table_info` com o caminho absoluto `<resource_directory>\contracts\operational_v1.json` da configuração. O teste muda o CWD para um diretório vazio e ainda captura o snapshot. O Analyst implementa seu próprio parser estrito para `YYYY-MM-DDTHH:MM:SS.ffffffZ`; não importa serializer, store nem migration do Core. Divergência vira fallback de snapshot e zero HTTP.
+Antes de ler dados, comparar versão, `ready=1`, `timestamp_format`, `rule_version`, SHA-256 e a matriz exata de colunas obtida por `PRAGMA table_info` com o caminho absoluto `<resource_directory>/contracts/operational_v1.json` da configuração. O teste muda o CWD para um diretório vazio e ainda captura o snapshot. O Analyst implementa seu próprio parser estrito para `YYYY-MM-DDTHH:MM:SS.ffffffZ`; não importa serializer, store nem migration do Core. Divergência vira fallback de snapshot e zero HTTP.
 
 As consultas devem selecionar explicitamente as colunas do manifesto, nunca `SELECT *`; usar bounds formatados canonicamente e intervalos semiabertos por `received_at_utc`; ler `raw_events` com `LEFT JOIN measurements` por `event_id`, incluindo separadamente o bit bruto `duplicate` e `delivery_disposition`, além de `state_transitions`, o log append-only `alarms`, `runtime_health` e `operational_contract`; ordenar por timestamps e IDs. O DTO rejeita disposição fora de `NEW/FIRST_LOCAL_COPY/ALREADY_COMMITTED`. Para cada intervalo e cada par `(reservoir_id,machine)`, executar uma query para a última transição com `effective_at_utc < start` e uni-la às transições `effective_at_utc >= start AND effective_at_utc < end`; deduplicar por `transition_id`. Isso fornece o left carry separadamente para qualidade e processo nas janelas atual, 24h e sete dias. Alarmes ativos são derivados pela última lifecycle de cada `alarm_id`, sendo `RECOVERED` inativo e `STATUS_UPDATED` ainda ativo. O deadline total passado pelo caller é `start+10s`.
 
@@ -499,13 +521,13 @@ Converter `sqlite3.OperationalError` causado pelo progress handler em `SnapshotD
 
 - [ ] **Step 4: Executar testes com writer concorrente e query lenta**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_operational_snapshot.py tests/integration/test_operational_query_deadline.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_operational_snapshot.py tests/integration/test_operational_query_deadline.py -v`
 
 Expected: PASS; query interrompida antes de 10,5s gera `SnapshotDeadlineExceeded` e não tenta novamente nessa execução.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/persistence/operational_reader.py tests/integration/test_operational_snapshot.py tests/integration/test_operational_query_deadline.py
 git commit -m "feat: capture read-only operational snapshots"
 ```
@@ -542,7 +564,7 @@ def test_trigger_alignment(now_utc, expected_end_utc, expected_trigger_utc) -> N
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_scheduler.py tests/integration/test_batch_recovery.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_scheduler.py tests/integration/test_batch_recovery.py -v`
 
 Expected: FAIL por scheduler ausente.
 
@@ -565,13 +587,13 @@ Se batch encerrado não existe, criá-lo. Se possui pacote selado, reutilizá-lo
 
 - [ ] **Step 4: Executar testes de restart, atraso e concorrência**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_scheduler.py tests/integration/test_batch_recovery.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_scheduler.py tests/integration/test_batch_recovery.py -v`
 
 Expected: PASS; dois schedulers concorrentes produzem um batch e um relatório lógico.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/scheduler.py src/statistical_analyst/persistence/analysis_store.py tests/unit/test_analyst_scheduler.py tests/integration/test_batch_recovery.py
 git commit -m "feat: schedule idempotent four-hour analysis batches"
 ```
@@ -615,7 +637,7 @@ def test_four_hour_coverage_boundaries(slots, expected, spread_series) -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_slot_selection.py tests/unit/test_sufficiency.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_slot_selection.py tests/unit/test_sufficiency.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -639,13 +661,13 @@ Somente `start <= received_at < end`. `retain` e `delivery_disposition=ALREADY_C
 
 - [ ] **Step 4: Executar testes de propriedade e limites inclusivos**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_slot_selection.py tests/unit/test_sufficiency.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_slot_selection.py tests/unit/test_sufficiency.py -v`
 
 Expected: PASS, inclusive gap exatamente no limite e um segundo acima.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/windows.py src/statistical_analyst/analysis/slot_selection.py src/statistical_analyst/analysis/sufficiency.py tests/unit/test_slot_selection.py tests/unit/test_sufficiency.py
 git commit -m "feat: select sufficient five-minute analysis series"
 ```
@@ -689,7 +711,7 @@ def test_gap_sums_only_excess_over_ten_minutes_including_edges() -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_descriptive_statistics.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_descriptive_statistics.py -v`
 
 Expected: FAIL por módulo ausente.
 
@@ -717,13 +739,13 @@ Usar `statistics.mean`, `median`, `stdev` (n-1), MAD bruto sem fator, sem arredo
 
 - [ ] **Step 4: Executar fixtures e comparar JSON dourado**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_descriptive_statistics.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_descriptive_statistics.py -v`
 
 Expected: PASS para n=0,1,2,>=3, bordas e um segundo acima de 10 minutos.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/descriptive.py tests/unit/test_descriptive_statistics.py tests/fixtures/golden/descriptive_cases.json
 git commit -m "feat: calculate deterministic descriptive metrics"
 ```
@@ -771,7 +793,7 @@ def test_eta_is_null_for_opposite_direction_or_stale_sample() -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analysis_trends.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analysis_trends.py -v`
 
 Expected: FAIL por módulo ausente.
 
@@ -801,13 +823,13 @@ def eta_at_window_end(last: TimedValue, slope: float, target: float,
 
 - [ ] **Step 4: Executar matriz dourada de tendências**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analysis_trends.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analysis_trends.py -v`
 
 Expected: PASS, incluindo timestamps iguais, ETA zero/null/válida e horizonte.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/trends.py tests/unit/test_analysis_trends.py tests/fixtures/golden/trend_cases.json
 git commit -m "feat: project deterministic trend and ETA metrics"
 ```
@@ -860,7 +882,7 @@ def test_zero_historical_mad_makes_robust_z_null_even_when_reference_usable() ->
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_historical_comparison.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_historical_comparison.py -v`
 
 Expected: FAIL por módulo ausente.
 
@@ -888,13 +910,13 @@ As sete janelas devem ser calculadas por mesmo intervalo local usando `ZoneInfo`
 
 - [ ] **Step 4: Executar testes históricos e mudança de data**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_historical_comparison.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_historical_comparison.py -v`
 
 Expected: PASS para 3/4/5/6 dias, 3/4 completos, robust z abaixo/exato/acima 3.5 e razões 0.67/1.50 inclusivas.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/historical.py tests/unit/test_historical_comparison.py tests/fixtures/golden/historical_cases.json
 git commit -m "feat: compare independent historical reservoir windows"
 ```
@@ -955,7 +977,7 @@ def test_complete_requires_all_three_references_complete(complete_package) -> No
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_state_durations.py tests/unit/test_local_classification.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_state_durations.py tests/unit/test_local_classification.py -v`
 
 Expected: FAIL por módulos ausentes.
 
@@ -978,18 +1000,18 @@ Usar estado imediatamente anterior ao start como carry de cada máquina, recorta
 
 - [ ] **Step 4: Executar testes de todas as combinações locais**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_state_durations.py tests/unit/test_local_classification.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_state_durations.py tests/unit/test_local_classification.py -v`
 
 Expected: PASS; nenhuma API/model aparece nesses módulos.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/state_durations.py src/statistical_analyst/analysis/classification.py tests/unit/test_state_durations.py tests/unit/test_local_classification.py
 git commit -m "feat: classify analysis status and local priority"
 ```
 
-### Task 10: Package builder, allowlist e selagem antes de HTTP
+### Task 10: Package builder, allowlist e selagem antes da chamada ao modelo
 
 **Files:**
 - Create: `src/statistical_analyst/analysis/package_builder.py`
@@ -1046,7 +1068,7 @@ def test_security_scan_blocks_sensitive_text(value) -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_package_builder.py tests/unit/test_security_scan.py tests/integration/test_sealed_input_restart.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_package_builder.py tests/unit/test_security_scan.py tests/integration/test_sealed_input_restart.py -v`
 
 Expected: FAIL por package builder ausente.
 
@@ -1077,13 +1099,13 @@ class AnalysisPackage(BaseModel):
 
 - [ ] **Step 4: Executar testes de restart e corrida de late arrival**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_package_builder.py tests/unit/test_security_scan.py tests/integration/test_sealed_input_restart.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_package_builder.py tests/unit/test_security_scan.py tests/integration/test_sealed_input_restart.py -v`
 
 Expected: PASS; restart devolve bytes idênticos e evento tardio aparece somente em manifesto futuro.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/analysis/package_builder.py src/statistical_analyst/security.py src/statistical_analyst/persistence/analysis_store.py tests/unit/test_package_builder.py tests/unit/test_security_scan.py tests/integration/test_sealed_input_restart.py
 git commit -m "feat: seal allowlisted analysis packages"
 ```
@@ -1092,26 +1114,26 @@ git commit -m "feat: seal allowlisted analysis packages"
 
 **Files:**
 - Modify: `pyproject.toml`
-- Create: `src/statistical_analyst/domain/openai_contract.py`
+- Create: `src/statistical_analyst/domain/claude_contract.py`
 - Create: `src/statistical_analyst/ai/prompt.py`
 - Create: `resources/prompts/statistical_analyst_v1.txt`
 - Create: `resources/catalogs/action_codes_v1.json`
-- Create: `tests/unit/test_openai_schema.py`
+- Create: `tests/unit/test_claude_schema.py`
 - Create: `tests/unit/test_prompt_catalog.py`
-- Create: `tests/fixtures/golden/openai_schema_v1.json`
+- Create: `tests/fixtures/golden/claude_schema_v1.json`
 - Modify: `tests/integration/test_analyst_wheel_artifact.py`
 
 **Interfaces:**
 - Consumes: evidence IDs e versão da Task 10.
-- Produces: `AnalysisResponse`, `Finding`, `RecommendedCheck`, `canonical_openai_schema_v1()` gerado do Pydantic, `load_prompt_v1(resource_directory)` e catálogo fechado.
+- Produces: `AnalysisResponse`, `Finding`, `RecommendedCheck`, `canonical_claude_schema_v1()` gerado do Pydantic, `load_prompt_v1(resource_directory)` e catálogo fechado.
 
 - [ ] **Step 1: Escrever testes do schema e catálogo exatos**
 
 ```python
-# tests/unit/test_openai_schema.py
+# tests/unit/test_claude_schema.py
 def test_generated_schema_matches_reviewed_fixture() -> None:
-    schema = canonical_openai_schema_v1()
-    assert schema == load_json("tests/fixtures/golden/openai_schema_v1.json")
+    schema = canonical_claude_schema_v1()
+    assert schema == load_json("tests/fixtures/golden/claude_schema_v1.json")
     assert_all_objects_closed_and_required(schema)
     assert "uniqueItems" not in json.dumps(schema)
 
@@ -1151,7 +1173,7 @@ def test_isolated_wheel_contains_all_versioned_runtime_resources(isolated_wheel_
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_openai_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_claude_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py -v`
 
 Expected: FAIL por contrato ausente.
 
@@ -1198,48 +1220,77 @@ Acrescentar as duas chaves abaixo à tabela `[tool.setuptools.data-files]` já c
 "share/agente-mqtt/statistical-analyst/catalogs" = ["resources/catalogs/action_codes_v1.json"]
 ```
 
-`AnalysisResponse` é a fonte única do schema: `canonical_openai_schema_v1()` chama `model_json_schema()`, normaliza deterministicamente para o subconjunto Structured Outputs e calcula o hash versionado. `tests/fixtures/golden/openai_schema_v1.json` é somente uma fixture de regressão gerada/comparada no teste, não um arquivo de runtime nem uma segunda fonte. O prompt deve ordenar: usar apenas métricas; não recalcular; não relacionar reservatórios; aceitar status/tendência/ETA/prioridade locais; sem comandos; output apenas no schema; narrativa sem algarismos. Os loaders recebem o `resource_directory` absoluto, nunca consultam CWD, calculam SHA-256 e falham se versão/hash não corresponder ao catálogo de recursos esperado. Reinstalar o editable package e testar a presença de contrato, prompt e catálogo no data path do venv.
+`AnalysisResponse` é a fonte única do schema: `canonical_claude_schema_v1()` chama `model_json_schema()`, normaliza deterministicamente para o subconjunto de JSON Schema aceito por `claude -p --json-schema` na versão fixada do CLI (objetos fechados, todos os campos `required`, sem `uniqueItems`) e calcula o hash versionado. `tests/fixtures/golden/claude_schema_v1.json` é somente uma fixture de regressão gerada/comparada no teste, não um arquivo de runtime nem uma segunda fonte. O prompt deve ordenar: usar apenas métricas; não recalcular; não relacionar reservatórios; aceitar status/tendência/ETA/prioridade locais; sem comandos; output apenas no schema; narrativa sem algarismos. Os loaders recebem o `resource_directory` absoluto, nunca consultam CWD, calculam SHA-256 e falham se versão/hash não corresponder ao catálogo de recursos esperado. Reinstalar o editable package e testar a presença de contrato, prompt e catálogo no data path do venv.
 
-- [ ] **Step 4: Executar testes e validar schema contra subconjunto OpenAI**
+- [ ] **Step 4: Executar testes e validar schema contra o subconjunto aceito pelo `--json-schema`**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_openai_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_claude_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py -v`
 
 Expected: PASS; todos os campos required, `additionalProperties=false` em cada objeto, enums e maxItems corretos.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add pyproject.toml src/statistical_analyst/domain/openai_contract.py src/statistical_analyst/ai/prompt.py resources tests/unit/test_openai_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py tests/fixtures/golden/openai_schema_v1.json
-git commit -m "feat: define strict consultative OpenAI contract"
+```bash
+git add pyproject.toml src/statistical_analyst/domain/claude_contract.py src/statistical_analyst/ai/prompt.py resources tests/unit/test_claude_schema.py tests/unit/test_prompt_catalog.py tests/integration/test_analyst_wheel_artifact.py tests/fixtures/golden/claude_schema_v1.json
+git commit -m "feat: define strict consultative Claude contract"
 ```
 
-### Task 12: Validador do envelope bruto e fallback semântico
+### Task 12: Validador do envelope do Claude Code e fallback semântico
 
 **Files:**
+- Create: `src/statistical_analyst/ai/cli_envelope.py`
 - Create: `src/statistical_analyst/ai/response_validator.py`
+- Create: `tests/fixtures/claude_cli/success_v1.json`
+- Create: `tests/fixtures/claude_cli/error_variants_v1.json`
+- Create: `tests/unit/test_cli_envelope.py`
 - Create: `tests/unit/test_response_validator.py`
 
 **Interfaces:**
-- Consumes: `AnalysisResponse`, `SealedInput`, `ResponseEnvelope` neutro ao SDK.
-- Produces: `ValidatedInterpretation | ValidationFailure`; nenhuma repetição.
+- Consumes: `AnalysisResponse`, `SealedInput` e os bytes de `stdout` do `claude -p --output-format json`.
+- Produces: `parse_cli_envelope(stdout: bytes, exit_code: int) -> CliEnvelope` e `validate_response(envelope, sealed) -> ValidatedInterpretation | ValidationFailure`; nenhuma repetição.
 
-- [ ] **Step 1: Escrever matriz completa dos estados Responses API**
+As fixtures em `tests/fixtures/claude_cli/` são **capturadas da versão fixada do CLI** (Task 19, teste live) e revisadas manualmente: chaves, tipos e exemplos de `subtype` de erro. Trocar a versão do CLI exige recapturar e revisar as fixtures.
+
+- [ ] **Step 1: Escrever a matriz de estados do envelope**
 
 ```python
+# tests/unit/test_cli_envelope.py
+def test_parse_success_fixture_keeps_raw_fields(success_stdout) -> None:
+    env = parse_cli_envelope(success_stdout, exit_code=0)
+    assert env.type == "result" and env.subtype == "success" and env.is_error is False
+    assert env.structured_output is not None
+    assert env.session_id and env.total_cost_usd is not None
+    assert env.usage.input_tokens >= 0 and env.usage.output_tokens >= 0
+    assert set(env.model_usage) == {"claude-sonnet-5-5"}
+
+@pytest.mark.parametrize("stdout", [b"", b"not json", b"[]", b'{"type":"assistant"}'])
+def test_unparseable_stdout_is_envelope_error(stdout) -> None:
+    env = parse_cli_envelope(stdout, exit_code=0)
+    assert env.parse_error is not None
+
+def test_stdout_over_64_kib_is_rejected_without_parsing() -> None:
+    assert parse_cli_envelope(b"{" + b" " * 70_000 + b"}", exit_code=0).parse_error == "STDOUT_TOO_LARGE"
+
 # tests/unit/test_response_validator.py
 @pytest.mark.parametrize("envelope", [
-    envelope(status="incomplete", incomplete_reason="max_output_tokens"),
-    envelope(status="failed"), envelope(status="completed", refusal="cannot comply"),
-    envelope(status="completed", output=[]), envelope(status="completed", messages=2),
-    envelope(status="completed", output_texts=2), envelope(status="completed", tool_item=True),
+    envelope(exit_code=1),
+    envelope(is_error=True, subtype="error_during_execution"),
+    envelope(subtype="error_max_budget_usd"),
+    envelope(subtype="error_max_turns"),
+    envelope(structured_output=None),
+    envelope(permission_denials=[{"tool_name": "Read"}]),
+    envelope(tool_uses=1),
+    envelope(model_usage={"claude-sonnet-5-5": {}, "claude-haiku-5-5": {}}),
+    envelope(model_usage={"claude-opus-5-5": {}}),
+    envelope(usage=None),
 ])
-def test_noncanonical_response_is_fallback(envelope, sealed_input) -> None:
+def test_noncanonical_envelope_is_fallback(envelope, sealed_input) -> None:
     result = validate_response(envelope, sealed_input)
     assert isinstance(result, ValidationFailure)
     assert result.retry_allowed is False
 
-def test_reasoning_item_is_allowed_but_only_one_visible_message(sealed_input) -> None:
-    result = validate_response(valid_envelope(reasoning_items=1), sealed_input)
+def test_free_text_result_is_ignored_when_structured_output_is_valid(sealed_input) -> None:
+    result = validate_response(valid_envelope(result_text="qualquer texto 123"), sealed_input)
     assert isinstance(result, ValidatedInterpretation)
 
 @pytest.mark.parametrize("text", ["nível 1", "abrir válvula", "parar bomba", "setpoint", "override"])
@@ -1250,21 +1301,28 @@ def test_digits_and_control_language_are_rejected(text, sealed_input) -> None:
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_response_validator.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_cli_envelope.py tests/unit/test_response_validator.py -v`
 
-Expected: FAIL por validador ausente.
+Expected: FAIL por módulos ausentes.
 
-- [ ] **Step 3: Implementar pipeline de validação em ordem fixa**
+- [ ] **Step 3: Implementar parser tolerante e validação em ordem fixa**
 
 ```python
-def validate_response(envelope: ResponseEnvelope, sealed: SealedInput) -> ValidationResult:
-    if envelope.status != "completed" or envelope.incomplete_details is not None:
-        return failure("RESPONSE_NOT_COMPLETED")
-    if envelope.refusal is not None or envelope.error is not None:
-        return failure("REFUSAL_OR_ERROR")
-    if len(envelope.visible_messages) != 1 or len(envelope.output_texts) != 1 or envelope.has_tool_output:
-        return failure("OUTPUT_CARDINALITY")
-    raw = envelope.output_texts[0].encode("utf-8")
+# src/statistical_analyst/ai/response_validator.py
+def validate_response(envelope: CliEnvelope, sealed: SealedInput) -> ValidationResult:
+    if envelope.parse_error is not None or envelope.exit_code != 0:
+        return failure("CLI_ENVELOPE_INVALID")
+    if envelope.type != "result" or envelope.subtype != "success" or envelope.is_error:
+        return failure("CLI_NOT_SUCCESS")
+    if envelope.tool_use_count or envelope.permission_denials:
+        return failure("TOOL_USE_ATTEMPTED")
+    if set(envelope.model_usage) != {FIXED_MODEL}:
+        return failure("MODEL_MISMATCH")
+    if envelope.usage is None:
+        return failure("USAGE_MISSING")
+    if envelope.structured_output is None:
+        return failure("STRUCTURED_OUTPUT_MISSING")
+    raw = canonical_json_bytes(envelope.structured_output)
     if len(raw) > 6000:
         return failure("VISIBLE_OUTPUT_TOO_LARGE")
     try:
@@ -1276,19 +1334,27 @@ def validate_response(envelope: ResponseEnvelope, sealed: SealedInput) -> Valida
     return validate_narrative_and_evidence(parsed, sealed)
 ```
 
-Validar todas as refs no catálogo de entrada; unicidade; nenhum algarismo Unicode em texto livre; denylist de controle com normalização casefold; action codes no catálogo. Guardar raw para auditoria no banco analítico, mas nunca enviar se falhar. `ValidationFailure.retry_allowed` é sempre false para esta Task.
+`parse_cli_envelope` faz o seguinte:
+
+- limita `stdout` a 64 KiB e decodifica UTF-8 estrito;
+- aceita chaves desconhecidas, que são preservadas para auditoria, mas exige `type`, `subtype`, `is_error`, `session_id`, `usage`, `total_cost_usd` e `modelUsage` com os tipos das fixtures revisadas;
+- conta `tool_use_count` a partir de `num_turns`/`permission_denials` e de qualquer indicação de ferramenta presente na fixture da versão fixada.
+
+O texto livre `result` nunca é usado: só `structured_output`, e mesmo ele passa de novo pelo Pydantic local, sem confiar no `--json-schema` do CLI.
+
+Validar todas as refs contra o catálogo de entrada, com unicidade. Rejeitar qualquer algarismo Unicode em texto livre. Aplicar a denylist de comandos de controle com normalização casefold e conferir os action codes no catálogo. O envelope bruto fica em `analytics.sqlite` para auditoria, mas nunca é enviado se a validação falhar. `ValidationFailure.retry_allowed` é sempre false nesta Task.
 
 - [ ] **Step 4: Executar matriz inteira**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_response_validator.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_cli_envelope.py tests/unit/test_response_validator.py -v`
 
-Expected: PASS para completed válido, reasoning opaco permitido e todo edge state rejeitado.
+Expected: PASS para o envelope de sucesso válido; todo estado de erro, ferramenta, modelo divergente ou ausência de saída estruturada é rejeitado.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/statistical_analyst/ai/response_validator.py tests/unit/test_response_validator.py
-git commit -m "feat: validate OpenAI responses before operator use"
+```bash
+git add src/statistical_analyst/ai/cli_envelope.py src/statistical_analyst/ai/response_validator.py tests/fixtures/claude_cli tests/unit/test_cli_envelope.py tests/unit/test_response_validator.py
+git commit -m "feat: validate Claude Code envelopes before operator use"
 ```
 
 ### Task 13: Orçamento móvel, circuit breaker e retry policy
@@ -1296,16 +1362,17 @@ git commit -m "feat: validate OpenAI responses before operator use"
 **Files:**
 - Create: `src/statistical_analyst/ai/retry_policy.py`
 - Create: `src/statistical_analyst/ai/circuit_breaker.py`
+- Create: `resources/catalogs/claude_error_classes_v1.json`
 - Modify: `src/statistical_analyst/persistence/usage_store.py`
 - Create: `tests/unit/test_retry_policy.py`
 - Create: `tests/unit/test_circuit_breaker.py`
 - Create: `tests/integration/test_usage_concurrency.py`
 
 **Interfaces:**
-- Consumes: Clock e `analytics.sqlite`.
-- Produces: `UsageBudget.try_reserve/reconcile`, `classify_error`, `next_retry`, `CircuitBreaker.allow/record`.
+- Consumes: Clock, `analytics.sqlite`, `CliEnvelope` e o resultado bruto do subprocesso (`exit_code`, timeout, `stderr` já truncado).
+- Produces: `UsageBudget.try_reserve/reconcile`, `classify_error`, `next_retry` e `CircuitBreaker.allow/record`.
 
-- [ ] **Step 1: Escrever testes dos limites e erro sem usage**
+- [ ] **Step 1: Escrever testes dos limites, do custo e da classificação**
 
 ```python
 # tests/integration/test_usage_concurrency.py
@@ -1317,47 +1384,50 @@ def test_timeout_keeps_full_reservation_for_twenty_four_hours(usage_store, now) 
     reservation = usage_store.try_reserve(uuid4(), now)
     usage_store.reconcile(reservation.reservation_id, usage=None, now=now + minutes(1))
     assert usage_store.totals(now + hours(23)).input_tokens == 5000
+    assert usage_store.totals(now + hours(23)).cost_usd == usage_store.max_budget_usd_per_call
     assert usage_store.totals(now + hours(24) + seconds(1)).input_tokens == 0
 
 def test_reconciled_usage_replaces_reserved_amount_without_losing_attempt(usage_store, now) -> None:
     reservation = usage_store.try_reserve(uuid4(), now)
-    usage_store.reconcile(reservation.reservation_id, usage=TokenUsage(input_tokens=1200, output_tokens=800), now=now)
+    usage_store.reconcile(reservation.reservation_id,
+                          usage=TokenUsage(input_tokens=900, cache_creation_input_tokens=200,
+                                           cache_read_input_tokens=100, output_tokens=800, cost_usd=Decimal("0.031")),
+                          now=now)
     totals = usage_store.totals(now)
     assert (totals.attempts, totals.input_tokens, totals.output_tokens) == (1, 1200, 800)
+    assert totals.cost_usd == Decimal("0.031")
+
+def test_daily_usd_budget_blocks_reservation(usage_store_with_daily_budget, now) -> None:
+    usage_store_with_daily_budget.seed_cost(Decimal("0.99"), at=now - hours(1))
+    assert usage_store_with_daily_budget.try_reserve(uuid4(), now) is None  # 0.99 + reserva por chamada > 1.00
 
 # tests/unit/test_retry_policy.py
-@pytest.mark.parametrize("status", [408, 409, 500, 502, 503])
-def test_retryable_http_statuses(status) -> None:
-    assert classify_error(http_error(status)).retryable is True
-
-def test_temporal_429_is_retryable_only_for_positive_allowlist() -> None:
-    assert classify_error(http_error(429, code="rate_limit_exceeded")).retryable is True
-    assert classify_error(http_error(429, code=None)).retryable is False
-    assert classify_error(http_error(429, code="unknown_usage_limit")).retryable is False
-
-@pytest.mark.parametrize("code", [
-    "credit_balance_exhausted", "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded", "usage_limit_exceeded",
+@pytest.mark.parametrize("raw", [
+    subprocess_timeout(), network_failure_envelope(), overloaded_envelope(), server_error_envelope(500),
+    rate_limited_envelope(retry_after_seconds=12),
 ])
-def test_spend_and_usage_errors_never_retry(code) -> None:
-    assert classify_error(http_error(429, code=code)).retryable is False
+def test_transient_failures_are_retryable(raw) -> None:
+    assert classify_error(raw).retryable is True
 
-@pytest.mark.parametrize("error", [network_error(), http_error(401), http_error(403), schema_error()])
-def test_network_retries_but_auth_permission_and_configuration_do_not(error) -> None:
-    expected = isinstance(error, NetworkError)
-    assert classify_error(error).retryable is expected
+@pytest.mark.parametrize("raw", [
+    auth_failure_envelope(), not_logged_in_envelope(), credit_exhausted_envelope(),
+    subscription_usage_limit_envelope(), max_budget_envelope(), unknown_error_envelope(),
+    cli_version_mismatch(), cli_binary_missing(),
+])
+def test_auth_quota_budget_configuration_and_unknown_never_retry(raw) -> None:
+    assert classify_error(raw).retryable is False
 
-def test_retry_after_delta_and_http_date_are_minimum_with_jitter(now) -> None:
-    delta = next_retry(http_error(429, code="rate_limit_exceeded", retry_after="12"), now, jitter=2, deadline=now + seconds(30))
-    dated = next_retry(http_error(503, retry_after=format_http_date(now + seconds(10))), now, jitter=2, deadline=now + seconds(30))
-    assert delta == now + seconds(14)
-    assert dated == now + seconds(12)
+def test_classification_uses_versioned_catalog_not_free_text_guessing(resource_directory) -> None:
+    catalog = load_error_catalog(resource_directory)
+    assert catalog.version == "claude-error-classes-v1"
+    assert catalog.cli_version == load_analyst_config_fixture().claude_cli_version
 
-def test_retry_is_refused_when_wait_would_cross_global_deadline(now) -> None:
-    assert next_retry(http_error(503, retry_after="60"), now, jitter=0, deadline=now + seconds(30)) is None
+def test_retry_after_is_minimum_with_jitter_and_respects_deadline(now) -> None:
+    assert next_retry(rate_limited_envelope(retry_after_seconds=12), now, jitter=2, deadline=now + seconds(30)) == now + seconds(14)
+    assert next_retry(rate_limited_envelope(retry_after_seconds=60), now, jitter=0, deadline=now + seconds(30)) is None
 
 def test_physical_retry_reserves_a_distinct_attempt_and_success_resets_transient_count(retry_harness) -> None:
-    retry_harness.fail_once(network_error()).then_succeed()
+    retry_harness.fail_once(subprocess_timeout()).then_succeed()
     result = retry_harness.run()
     assert result.status == "completed"
     assert retry_harness.distinct_reservation_count == 2
@@ -1366,7 +1436,7 @@ def test_physical_retry_reserves_a_distinct_attempt_and_success_resets_transient
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py -v`
 
 Expected: FAIL por policy/store incompletos.
 
@@ -1376,143 +1446,217 @@ Expected: FAIL por policy/store incompletos.
 def try_reserve(self, attempt_id: UUID, now: datetime, input_tokens: int = 5000, output_tokens: int = 4000):
     cutoff = now - timedelta(hours=24)
     with self._transaction("IMMEDIATE") as conn:
-        attempts, inputs, outputs = conn.execute(
-            "SELECT count(*),coalesce(sum(accounted_input_tokens),0),coalesce(sum(accounted_output_tokens),0) FROM usage_reservations WHERE reserved_at_utc>?",
+        attempts, inputs, outputs, cost = conn.execute(
+            "SELECT count(*),coalesce(sum(accounted_input_tokens),0),coalesce(sum(accounted_output_tokens),0),"
+            "coalesce(sum(accounted_cost_micro_usd),0) FROM usage_reservations WHERE reserved_at_utc>?",
             (iso(cutoff),),
         ).fetchone()
-        if attempts >= 24 or inputs + input_tokens > 120000 or outputs + output_tokens > 96000:
+        reserve_cost = to_micro_usd(self._max_budget_usd_per_call)
+        if (attempts >= 24 or inputs + input_tokens > 120000 or outputs + output_tokens > 96000
+                or cost + reserve_cost > to_micro_usd(self._daily_budget_usd)):
             return None
-        return insert_reservation(conn, attempt_id, now, input_tokens, output_tokens)
+        return insert_reservation(conn, attempt_id, now, input_tokens, output_tokens, reserve_cost)
 ```
 
-Reconcile com usage confiável reduz reserva aos valores reais; sem usage mantém 5000/4000. Se o uso real exceder qualquer reserva, persistir o uso real, abrir o breaker de configuração e impedir novas chamadas até nova validação e restart controlado. Retry: máximo 1; rede/408/409/5xx e 429 somente quando o código pertence à allowlist temporal versionada. Qualquer 429 desconhecido ou limite de uso é não transitório por padrão seguro. Interpretar `Retry-After` tanto em delta-seconds quanto HTTP-date, usá-lo como mínimo, somar jitter injetável e recusar espera além do deadline; sem header válido, exponencial+jitter <=30s. Breaker abre 24h para auth/crédito/spend; transitório após três falhas consecutivas até próxima janela e volta a zero após sucesso; configuração pode fechar somente em restart controlado. Existe uma única camada de retry e cada tentativa física recebe `attempt_id`/reserva distintos antes de enviar bytes.
+Adicionar à migração analítica as colunas `reserved_cost_micro_usd` e `accounted_cost_micro_usd` (INTEGER ≥ 0). Custos são guardados em micro-USD inteiros, nunca em float.
 
-- [ ] **Step 4: Executar testes de corrida, rolling window e breaker persistente**
+Reconciliação com `usage` confiável:
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py -v`
+- `accounted_input_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`;
+- os tokens de saída e o `total_cost_usd` substituem os valores reservados;
+- sem `usage`, a reserva fica integral (5.000/4.000 e `max_budget_usd_per_call`);
+- se o uso real exceder qualquer reserva, ou se `subtype=error_max_budget_usd`, persiste o uso real, abre o breaker de configuração e bloqueia novas chamadas até nova validação e reinício controlado.
 
-Expected: PASS; retry físico só ocorre após uma nova reserva bem-sucedida.
+`classify_error` usa somente o catálogo versionado `claude_error_classes_v1.json`. Ele mapeia combinações de `exit_code`, `subtype`, timeout e padrões de mensagem **capturados da versão fixada do CLI** (fixtures da Task 12) para as classes `transient`, `auth`, `quota`, `budget`, `configuration` e `unknown`. Erro desconhecido é não transitório por padrão seguro.
+
+Regras de retry e breaker:
+
+- Retry: no máximo 1, só para `transient`. Se a mensagem trouxer retry-after, ele é o mínimo de espera; soma-se jitter injetável, e a espera nunca passa do deadline. Sem retry-after: exponencial + jitter ≤ 30 s.
+- Breaker de 24 h para `auth` e `quota`. Isso inclui fim de cota da assinatura, que vira fallback até a próxima janela de cota sem tentativa extra.
+- Breaker transitório depois de três falhas `transient` consecutivas, até a próxima janela; ele zera após um sucesso.
+- `configuration`, que inclui versão divergente e binário ausente, só fecha em reinício controlado.
+
+As retentativas internas do próprio CLI contra a API contam dentro da mesma tentativa física e do mesmo timeout de 60 s. O teste de boundary (Task 14) confirma que o tempo total do subprocesso nunca passa desse limite. Existe uma única camada de retry na aplicação, e cada tentativa física recebe `attempt_id`/reserva distintos antes de iniciar o subprocesso.
+
+- [ ] **Step 4: Executar testes de corrida, janela móvel, custo e breaker persistente**
+
+Run: `.venv/bin/python -m pytest tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py -v`
+
+Expected: PASS. O retry físico só ocorre após uma nova reserva bem-sucedida, e o orçamento em USD bloqueia antes de o subprocesso começar.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/statistical_analyst/ai/retry_policy.py src/statistical_analyst/ai/circuit_breaker.py src/statistical_analyst/persistence/usage_store.py tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py
-git commit -m "feat: enforce OpenAI retry and usage budgets"
+```bash
+git add resources/catalogs/claude_error_classes_v1.json src/statistical_analyst/ai/retry_policy.py src/statistical_analyst/ai/circuit_breaker.py src/statistical_analyst/persistence/usage_store.py tests/unit/test_retry_policy.py tests/unit/test_circuit_breaker.py tests/integration/test_usage_concurrency.py
+git commit -m "feat: enforce Claude retry, token and cost budgets"
 ```
 
-### Task 14: Adapter oficial OpenAI Responses API
+### Task 14: Adapter Claude Code headless (`claude -p`) sem ferramentas
 
 **Files:**
 - Create: `src/statistical_analyst/ai/request_builder.py`
-- Create: `src/statistical_analyst/ai/openai_client.py`
-- Create: `tests/unit/test_openai_request.py`
-- Create: `tests/integration/test_openai_sdk_boundary.py`
+- Create: `src/statistical_analyst/ai/claude_client.py`
+- Create: `tests/unit/test_claude_request.py`
+- Create: `tests/integration/test_claude_subprocess_boundary.py`
+- Create: `tests/fixtures/fake_claude_cli.py`
 
 **Interfaces:**
-- Consumes: `SealedInput`, resource directory absoluto, `SecretProvider`, `AnalysisResponse`, UsageBudget e retry policy.
-- Produces: `RequestBuilder(resource_directory).prepare(sealed) -> PreparedOpenAIRequest` com guard de bytes e `OfficialOpenAITransport.analyze(prepared,...) -> ResponseEnvelope` neutro ao SDK.
+- Consumes: `SealedInput`, resource directory absoluto, `SecretProvider`, `AnalysisResponse`, UsageBudget, retry policy e `AnalystConfig` (`claude_cli_path`, `claude_cli_version`, `claude_workdir`, `claude_home`, `claude_credential_kind`).
+- Produces: `RequestBuilder(resource_directory).prepare(sealed) -> PreparedClaudeRequest`, com guard de bytes, e `ClaudeCodeTransport.analyze(prepared, client_request_id) -> CliEnvelope`.
 
-- [ ] **Step 1: Escrever teste do request exato e tradução do envelope**
+- [ ] **Step 1: Escrever testes do comando exato, do ambiente e do isolamento**
 
 ```python
-# tests/unit/test_openai_request.py
-@pytest.mark.asyncio
-async def test_request_has_fixed_model_and_no_tools_or_history(sealed_input, request_builder, recording_sdk) -> None:
-    transport = OfficialOpenAITransport(lambda: recording_sdk)
-    prepared = request_builder.prepare(sealed_input)
-    await transport.analyze(prepared, UUID("12345678-1234-4234-8234-123456789abc"))
-    request = recording_sdk.last_request
-    assert request["model"] == "gpt-5.6-luna"
-    assert request["reasoning"] == {"effort": "low"}
-    assert request["store"] is False
-    assert request["background"] is False
-    assert request["truncation"] == "disabled"
-    assert request["max_output_tokens"] == 4000
-    assert request["text_format"] is AnalysisResponse
-    assert "tools" not in request and "previous_response_id" not in request
-    assert request["extra_headers"]["X-Client-Request-Id"] == "12345678-1234-4234-8234-123456789abc"
-    assert prepared.full_text_size_bytes <= 16_000
+# tests/unit/test_claude_request.py
+FORBIDDEN_FLAGS = {"--fallback-model", "--resume", "--continue", "--mcp-config", "--add-dir",
+                   "--allowedTools", "--allowed-tools", "--dangerously-skip-permissions", "--agents"}
 
-def test_combined_prompt_input_and_schema_over_limit_fails_before_http(oversized_sealed_input, request_builder, recording_sdk) -> None:
+def test_argv_is_fixed_and_has_no_tools_or_external_context(prepared_request, transport_factory) -> None:
+    argv = transport_factory().build_argv(prepared_request)
+    assert argv[0] == "/opt/claude-code/bin/claude"
+    assert argv[1] == "-p"
+    assert pairs(argv)["--model"] == "claude-sonnet-5-5"
+    assert pairs(argv)["--effort"] == "low"
+    assert pairs(argv)["--output-format"] == "json"
+    assert pairs(argv)["--tools"] == ""
+    assert pairs(argv)["--setting-sources"] == ""
+    assert json.loads(pairs(argv)["--json-schema"]) == canonical_claude_schema_v1()
+    assert Path(pairs(argv)["--system-prompt-file"]).is_relative_to(prepared_request.resource_directory)
+    assert {"--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"} <= set(argv)
+    assert Decimal(pairs(argv)["--max-budget-usd"]) == prepared_request.max_budget_usd_per_call
+    assert not FORBIDDEN_FLAGS & set(argv)
+    assert prepared_request.sealed_json not in " ".join(argv)  # pacote só via stdin
+
+def test_environment_is_minimal_and_carries_exactly_one_credential(prepared_request, transport_factory, secrets) -> None:
+    env = transport_factory(credential_kind="api_key").build_env(secrets)
+    assert set(env) == {"PATH", "HOME", "ANTHROPIC_API_KEY", "DISABLE_AUTOUPDATER",
+                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_MAX_OUTPUT_TOKENS"}
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4000"
+    assert env["HOME"] == "/var/lib/agente-analista/claude-home"
+    oauth_env = transport_factory(credential_kind="oauth_token").build_env(secrets)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in oauth_env and "ANTHROPIC_API_KEY" not in oauth_env
+
+def test_combined_prompt_input_and_schema_over_limit_fails_before_subprocess(oversized_sealed_input, request_builder, spawn_recorder) -> None:
     with pytest.raises(RequestPayloadTooLarge):
         request_builder.prepare(oversized_sealed_input)
-    assert recording_sdk.call_count == 0
+    assert spawn_recorder.call_count == 0
 
-# tests/integration/test_openai_sdk_boundary.py
+# tests/integration/test_claude_subprocess_boundary.py  (usa tests/fixtures/fake_claude_cli.py como binário)
 @pytest.mark.asyncio
-async def test_serialized_http_body_contains_strict_reviewed_schema(sealed_input, request_builder, recording_http) -> None:
-    transport = OfficialOpenAITransport.from_http_client(recording_http)
-    await transport.analyze(request_builder.prepare(sealed_input), uuid4())
-    body = recording_http.last_json_body
-    assert body["text"]["format"]["type"] == "json_schema"
-    assert body["text"]["format"]["strict"] is True
-    assert body["text"]["format"]["schema"] == load_json("tests/fixtures/golden/openai_schema_v1.json")
-    assert "tools" not in body and "previous_response_id" not in body
-
-def test_sdk_envelope_preserves_raw_cardinality_and_ids(fake_sdk_response) -> None:
-    envelope = translate_response(fake_sdk_response)
-    assert envelope.response_id == fake_sdk_response.id
-    assert envelope.request_id == fake_sdk_response._request_id
-    assert len(envelope.raw_output_items) == len(fake_sdk_response.output)
+async def test_stdin_carries_sealed_package_and_cwd_is_empty_workdir(fake_cli_transport, prepared_request) -> None:
+    envelope = await fake_cli_transport.analyze(prepared_request, uuid4())
+    seen = fake_cli_transport.fake.last_invocation
+    assert seen.stdin == prepared_request.stdin_bytes
+    assert seen.cwd == "/var/lib/agente-analista/claude-empty" or seen.cwd == str(fake_cli_transport.workdir)
+    assert seen.cwd_listing == []
+    assert envelope.subtype == "success"
 
 @pytest.mark.asyncio
-async def test_each_physical_attempt_rereads_rotated_windows_credential(prepared_request, rotating_secret_provider, recording_client_factory) -> None:
-    factory = CredentialBackedOpenAIClientFactory(
-        rotating_secret_provider, "AgenteMQTT/StatisticalAnalyst/OpenAI", recording_client_factory
-    )
-    transport = OfficialOpenAITransport(factory)
+async def test_timeout_kills_whole_process_group_and_returns_timeout(fake_cli_transport, prepared_request) -> None:
+    fake_cli_transport.fake.hang_with_child_process()
+    envelope = await fake_cli_transport.analyze(prepared_request, uuid4(), timeout_seconds=1)
+    assert envelope.timed_out is True
+    assert fake_cli_transport.fake.no_surviving_processes()
+
+@pytest.mark.asyncio
+async def test_each_physical_attempt_rereads_rotated_credential(fake_cli_transport, prepared_request, rotating_secret_provider) -> None:
     rotating_secret_provider.value = "first"
-    await transport.analyze(prepared_request, uuid4())
+    await fake_cli_transport.analyze(prepared_request, uuid4())
     rotating_secret_provider.value = "rotated"
-    await transport.analyze(prepared_request, uuid4())
-    assert recording_client_factory.api_keys == ["first", "rotated"]
+    await fake_cli_transport.analyze(prepared_request, uuid4())
+    assert fake_cli_transport.fake.credentials_seen == ["first", "rotated"]
+
+@pytest.mark.asyncio
+async def test_stderr_is_truncated_and_redacted_never_logged_raw(fake_cli_transport, prepared_request, caplog) -> None:
+    fake_cli_transport.fake.write_stderr("token sk-ant-xyz leaked " * 1000)
+    envelope = await fake_cli_transport.analyze(prepared_request, uuid4())
+    assert len(envelope.stderr_excerpt) <= 2048 and "sk-ant-xyz" not in envelope.stderr_excerpt
+    assert "sk-ant-xyz" not in caplog.text
+
+def test_cli_version_mismatch_blocks_before_any_analysis(transport_factory, fake_cli_reporting_version) -> None:
+    fake_cli_reporting_version("9.9.9 (Claude Code)")
+    with pytest.raises(ClaudeCliVersionMismatch):
+        transport_factory().preflight()
 ```
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_openai_request.py tests/integration/test_openai_sdk_boundary.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_claude_request.py tests/integration/test_claude_subprocess_boundary.py -v`
 
 Expected: FAIL por adapter ausente.
 
-- [ ] **Step 3: Implementar SDK com retries automáticos desativados**
+- [ ] **Step 3: Implementar o transporte por subprocesso**
 
 ```python
-class OfficialOpenAITransport:
-    def __init__(self, client_factory: Callable[[], AsyncOpenAI]) -> None:
-        self._client_factory = client_factory
+# src/statistical_analyst/ai/claude_client.py
+class ClaudeCodeTransport:
+    def build_argv(self, prepared: PreparedClaudeRequest) -> list[str]:
+        return [
+            str(self._cfg.claude_cli_path), "-p",
+            "--model", FIXED_MODEL,
+            "--effort", "low",
+            "--output-format", "json",
+            "--json-schema", prepared.schema_json,
+            "--system-prompt-file", str(prepared.system_prompt_path),
+            "--tools", "",
+            "--strict-mcp-config",
+            "--setting-sources", "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--max-budget-usd", str(prepared.max_budget_usd_per_call),
+        ]
 
-    async def analyze(self, prepared: PreparedOpenAIRequest, client_request_id: UUID) -> ResponseEnvelope:
-        client = self._client_factory()  # relê Credential Manager em cada tentativa física
-        response = await client.responses.parse(
-            model="gpt-5.6-luna",
-            instructions=prepared.instructions,
-            input=prepared.input_text,
-            text_format=AnalysisResponse,
-            reasoning={"effort": "low"},
-            store=False,
-            background=False,
-            truncation="disabled",
-            max_output_tokens=4000,
-            extra_headers={"X-Client-Request-Id": str(client_request_id)},
+    async def analyze(self, prepared: PreparedClaudeRequest, client_request_id: UUID,
+                      timeout_seconds: float = 60.0) -> CliEnvelope:
+        env = self.build_env(self._secrets)            # relê a credencial a cada tentativa física
+        proc = await asyncio.create_subprocess_exec(
+            *self.build_argv(prepared),
+            stdin=PIPE, stdout=PIPE, stderr=PIPE,
+            cwd=self._cfg.claude_workdir, env=env, start_new_session=True,
         )
-        return translate_response(response)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(prepared.stdin_bytes), timeout_seconds)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            kill_process_group(proc.pid)               # SIGTERM, 2 s, depois SIGKILL no grupo
+            await proc.wait()
+            if isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                raise
+            return CliEnvelope.timeout(client_request_id)
+        return parse_cli_envelope(out, proc.returncode, stderr_excerpt=redact_truncate(err, 2048),
+                                  client_request_id=client_request_id)
 ```
 
-`CredentialBackedOpenAIClientFactory` recebe `SecretProvider`, target name e um construtor SDK injetável; chama `get_required()` em cada tentativa física e cria `AsyncOpenAI(api_key=..., max_retries=0, timeout=60.0)`. Não existe cache estático da chave. Um factory separado, aceitando `OPENAI_API_KEY`, é permitido somente pela fixture live opt-in e nunca pelo composition root do serviço. `RequestBuilder` carrega somente o prompt do `resource_directory` absoluto e obtém o schema em memória de `canonical_openai_schema_v1()`/`AnalysisResponse`; nunca lê a fixture de testes. Constrói a mesma representação textual que será serializada no body (`instructions`, JSON selado e JSON Schema, incluindo chaves/separadores estruturais), mede os bytes UTF-8 e reprova acima de 16.000. Esse guard roda antes de breaker, reserva e HTTP; não é apenas assert de fixture. O teste de boundary inspeciona o JSON HTTP depois da serialização do SDK para comprovar `text.format.type=json_schema`, `strict=true` e igualdade com a fixture dourada, além do teste unitário do argumento `text_format=AnalysisResponse`.
+`RequestBuilder` carrega só o prompt do `resource_directory` absoluto e obtém o schema em memória de `canonical_claude_schema_v1()`/`AnalysisResponse`; nunca lê a fixture de testes. `stdin_bytes` é o JSON selado canônico, precedido de uma linha fixa de instrução versionada. Mede-se o total de bytes UTF-8 de prompt de sistema + `stdin_bytes` + schema e reprova-se acima de 16.000. Esse guard roda antes do breaker, da reserva e do subprocesso.
 
-Não usar somente `response.output_text` ou `output_parsed`; traduzir status, incomplete, todos os output items/contents, refusal, usage, model, response id e `_request_id`. Classificar exceções do SDK sem persistir headers/body sensíveis. Se a versão 3.0.0 não aceitar algum parâmetro no teste de boundary, adaptar somente ao nome oficial dessa versão e manter o request sem tools/history.
+Regras do transporte:
+
+- `preflight()`, chamado na partida do serviço e a cada hora, executa `claude --version` com o mesmo ambiente mínimo e compara com `claude_cli_version`; também confirma que `claude_workdir` existe e está vazio. Qualquer falha abre o breaker `configuration`.
+- O `HOME` dedicado (`claude_home`) é o único lugar onde o CLI pode gravar estado próprio. Ele não contém `CLAUDE.md`, `settings.json`, agentes, skills nem servidores MCP; o verificador (Task 18) confirma isso.
+- O `stdout` é lido inteiro, mas o parser recusa mais de 64 KiB.
+- O `stderr` nunca é registrado bruto: só um trecho de até 2 KiB, redigido (chaves `sk-ant-…`, tokens OAuth, e-mails), entra em `analytics.sqlite`.
+- Exceções de `create_subprocess_exec` (binário ausente, permissão) viram `CliEnvelope` de classe `configuration`, sem propagar o ambiente nem a credencial.
+
+`tests/fixtures/fake_claude_cli.py` é um executável Python que imita a versão fixada: lê `stdin`, registra argv/cwd/env em um arquivo do `tmp_path` (com a credencial em hash), devolve as fixtures da Task 12 e simula travamento com processo filho, `stderr` grande e códigos de saída de erro.
 
 - [ ] **Step 4: Executar boundary test sem rede**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_openai_request.py tests/integration/test_openai_sdk_boundary.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_claude_request.py tests/integration/test_claude_subprocess_boundary.py -v`
 
-Expected: PASS usando transporte HTTP fake, comprovando guard real de 16.000 bytes, Structured Output estrito, `max_retries=0`, timeout 60s e envelope completo.
+Expected: PASS com o CLI falso. O teste comprova:
+
+- guard real de 16.000 bytes;
+- argv fixo sem ferramentas e ambiente mínimo;
+- pacote só via `stdin`;
+- CWD vazio;
+- timeout de 60 s matando o grupo de processos;
+- releitura da credencial a cada tentativa;
+- `stderr` redigido.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/statistical_analyst/ai/request_builder.py src/statistical_analyst/ai/openai_client.py tests/unit/test_openai_request.py tests/integration/test_openai_sdk_boundary.py
-git commit -m "feat: call fixed OpenAI Responses contract"
+```bash
+git add src/statistical_analyst/ai/request_builder.py src/statistical_analyst/ai/claude_client.py tests/unit/test_claude_request.py tests/integration/test_claude_subprocess_boundary.py tests/fixtures/fake_claude_cli.py
+git commit -m "feat: call fixed Claude model through headless Claude Code"
 ```
 
 ### Task 15: Coordenador de duas análises sob deadline global
@@ -1536,7 +1680,7 @@ async def test_one_reservoir_failure_falls_back_only_that_section(coordinator, t
     transport.result_for["0051"] = valid_envelope(reservoir="0051")
     transport.result_for["0022"] = TimeoutError()
     result = await coordinator.run_batch(WINDOW_KEY)
-    assert result.sections["0051"].source == "openai"
+    assert result.sections["0051"].source == "claude"
     assert result.sections["0022"].source == "local_fallback"
     assert transport.max_concurrency_seen == 2
 
@@ -1559,7 +1703,7 @@ async def test_global_deadline_cancels_pending_calls(coordinator_with_slow_trans
     assert coordinator_with_slow_transport.store.write_count == writes_at_return
 
 @pytest.mark.asyncio
-async def test_snapshot_deadline_returns_two_fallbacks_without_http(coordinator, reader, transport, budget) -> None:
+async def test_snapshot_deadline_returns_two_fallbacks_without_subprocess(coordinator, reader, transport, budget) -> None:
     reader.error = SnapshotDeadlineExceeded()
     result = await coordinator.run_batch(WINDOW_KEY)
     assert {section.fallback_reason for section in result.sections.values()} == {"OPERATIONAL_SNAPSHOT_UNAVAILABLE"}
@@ -1570,14 +1714,14 @@ async def test_snapshot_deadline_returns_two_fallbacks_without_http(coordinator,
 async def test_oversized_prepared_request_falls_back_before_reservation(coordinator, request_builder, transport, budget) -> None:
     request_builder.error_for["0051"] = RequestPayloadTooLarge(16_001)
     result = await coordinator.run_batch(WINDOW_KEY)
-    assert result.sections["0051"].fallback_reason == "OPENAI_REQUEST_TOO_LARGE"
+    assert result.sections["0051"].fallback_reason == "CLAUDE_REQUEST_TOO_LARGE"
     assert "0051" not in transport.calls
     assert budget.reservations_for("0051") == 0
 ```
 
 - [ ] **Step 2: Executar testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analysis_coordinator.py tests/integration/test_batch_end_to_end.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analysis_coordinator.py tests/integration/test_batch_end_to_end.py -v`
 
 Expected: FAIL por coordinator ausente.
 
@@ -1602,7 +1746,7 @@ async def run_batch(self, key: WindowKey, deadline_seconds: float = 180.0) -> Ba
         try:
             prepared[rid] = self._request_builder.prepare(sealed[rid])
         except RequestPayloadTooLarge:
-            early_fallbacks[rid] = self._fallback(sealed[rid], "OPENAI_REQUEST_TOO_LARGE")
+            early_fallbacks[rid] = self._fallback(sealed[rid], "CLAUDE_REQUEST_TOO_LARGE")
     tasks = {
         rid: asyncio.create_task(self._analyze_or_fallback(sealed[rid], prepared[rid], deadline))
         for rid in prepared
@@ -1622,19 +1766,19 @@ async def run_batch(self, key: WindowKey, deadline_seconds: float = 180.0) -> Ba
     return BatchResult(sections=sections)
 ```
 
-`_snapshot_failure_result` persiste o motivo seguro no batch e produz as duas seções locais sem pacote OpenAI nem HTTP; o renderizador ainda cria um único relatório de indisponibilidade operacional. Somente exceções esperadas de leitura/contrato viram esse fallback; `CancelledError` e falhas fatais de persistência preservam semântica de shutdown/fatal do serviço.
+`_snapshot_failure_result` persiste o motivo seguro no batch e produz as duas seções locais sem pacote nem subprocesso Claude; o renderizador ainda cria um único relatório de indisponibilidade operacional. Somente exceções esperadas de leitura/contrato viram esse fallback; `CancelledError` e falhas fatais de persistência preservam semântica de shutdown/fatal do serviço.
 
 Cada tentativa: request já validado, breaker allow, reserva, chamada, persistir response/usage, reconcile, validar. Retry transitório usa nova reserva. Output model diferente do solicitado é registrado e tratado como falha de contrato. Toda exceção de API vira `SectionResult` local; nunca escapa para o MQTT Core. Ao cancelar por deadline, reconciliar sem usage (mantendo 5000/4000), aguardar todas as tasks com `gather(return_exceptions=True)` e somente então retornar; nenhuma coroutine pode gravar depois do `BatchResult`.
 
 - [ ] **Step 4: Executar testes de restart em cada checkpoint**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analysis_coordinator.py tests/integration/test_batch_end_to_end.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analysis_coordinator.py tests/integration/test_batch_end_to_end.py -v`
 
 Expected: PASS para falha de snapshot, limite de request, falha antes/depois de selar, antes/depois de resposta e antes de report; restart reutiliza pacote, cancelamentos estão concluídos e budgets nunca são liberados sem usage confiável.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/app.py src/statistical_analyst/persistence/analysis_store.py tests/unit/test_analysis_coordinator.py tests/integration/test_batch_end_to_end.py
 git commit -m "feat: coordinate independent reservoir interpretations"
 ```
@@ -1676,15 +1820,15 @@ def test_llm_cannot_change_subject_recipients_priority_or_numbers(renderer, inte
 
 # tests/unit/test_local_fallback.py
 def test_fallback_is_deterministic_and_uses_only_catalog_codes(package, resource_directory) -> None:
-    first = build_fallback(package, reason="OPENAI_TIMEOUT", resource_directory=resource_directory)
-    second = build_fallback(package, reason="OPENAI_TIMEOUT", resource_directory=resource_directory)
+    first = build_fallback(package, reason="CLAUDE_TIMEOUT", resource_directory=resource_directory)
+    second = build_fallback(package, reason="CLAUDE_TIMEOUT", resource_directory=resource_directory)
     assert first == second
     assert set(first.action_codes) <= load_action_catalog(resource_directory).keys()
 ```
 
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_local_fallback.py tests/unit/test_report_renderer.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_local_fallback.py tests/unit/test_report_renderer.py -v`
 
 Expected: FAIL porque fallback e renderer não existem.
 
@@ -1719,13 +1863,13 @@ O view model numérico é reconstruído dos pacotes locais, nunca do texto da re
 
 - [ ] **Step 4: Executar regressão dos templates em texto e HTML**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_local_fallback.py tests/unit/test_report_renderer.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_local_fallback.py tests/unit/test_report_renderer.py -v`
 
 Expected: PASS; snapshots de texto e HTML são estáveis e nenhuma saída da LLM altera assunto, destinatários, prioridade, cadência ou números locais.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/domain/report.py src/statistical_analyst/reporting/fallback.py src/statistical_analyst/reporting/renderer.py tests/unit/test_local_fallback.py tests/unit/test_report_renderer.py
 git commit -m "feat: render safe consultative analysis reports"
 ```
@@ -1793,7 +1937,7 @@ def test_gmail_transport_rereads_rotated_app_password(fake_smtp, secret_provider
 
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_report_outbox.py tests/integration/test_analytics_gmail.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_report_outbox.py tests/integration/test_analytics_gmail.py -v`
 
 Expected: FAIL por store e transporte ausentes.
 
@@ -1830,40 +1974,43 @@ O contrato garante uma linha lógica por fingerprint e reutiliza o mesmo RFC `Me
 
 - [ ] **Step 4: Executar testes de crash/restart e SMTP fake**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/integration/test_report_outbox.py tests/integration/test_analytics_gmail.py -v`
+Run: `.venv/bin/python -m pytest tests/integration/test_report_outbox.py tests/integration/test_analytics_gmail.py -v`
 
 Expected: PASS; falha antes do envio é repetida, report já confirmado não é reenfileirado e toda repetição mantém fingerprint e `Message-ID`.
 
 - [ ] **Step 5: Commit**
 
-```powershell
+```bash
 git add src/statistical_analyst/persistence/analysis_store.py src/statistical_analyst/persistence/outbox_store.py src/statistical_analyst/reporting/gmail_transport.py src/statistical_analyst/reporting/dispatcher.py tests/integration/test_report_outbox.py tests/integration/test_analytics_gmail.py
 git commit -m "feat: deliver reports through isolated Gmail outbox"
 ```
 
-### Task 18: Runtime, serviço Windows, observabilidade e proteção local
+### Task 18: Runtime, serviço systemd, observabilidade e proteção local
 
 **Files:**
 - Consume unchanged: `resources/contracts/operational_v1.json`
 - Consume unchanged: `resources/prompts/statistical_analyst_v1.txt`
 - Consume unchanged: `resources/catalogs/action_codes_v1.json`
+- Consume unchanged: `resources/catalogs/claude_error_classes_v1.json`
 - Create: `src/statistical_analyst/__main__.py`
 - Create: `src/statistical_analyst/observability.py`
 - Modify: `src/statistical_analyst/security.py`
 - Create: `src/statistical_analyst/service/runtime.py`
-- Create: `src/statistical_analyst/service/windows_service.py`
-- Create: `scripts/install-statistical-analyst.ps1`
-- Create: `scripts/uninstall-statistical-analyst.ps1`
-- Create: `scripts/verify-statistical-analyst.ps1`
+- Create: `src/statistical_analyst/service/linux_service.py`
+- Create: `deploy/systemd/statistical-analyst.service`
+- Create: `scripts/install-statistical-analyst.sh`
+- Create: `scripts/uninstall-statistical-analyst.sh`
+- Create: `scripts/verify-statistical-analyst.sh`
 - Create: `tests/unit/test_analyst_runtime.py`
 - Create: `tests/unit/test_analyst_log_redaction.py`
 - Create: `tests/integration/test_analytics_retention_backup.py`
 - Create: `tests/integration/test_operational_readiness.py`
+- Create: `tests/integration/test_operational_readonly_permissions.py`
 - Create: `tests/operational/test_statistical_analyst_service.py`
 
 **Interfaces:**
-- Consumes: config validada, coordinator, scheduler, dispatcher, stop event e caminhos absolutos em `%ProgramData%`.
-- Produces: `AnalystRuntime.start/stop`, serviço `StatisticalAnalyst`, logs estruturados redigidos, retenção/backup de 90 dias e preflight real de implantação.
+- Consumes: config validada, coordinator, scheduler, dispatcher, stop event, `SystemdNotifier` (mesma implementação sem dependências do Core, copiada para `statistical_analyst.service`, sem importar o pacote do Core) e caminhos absolutos Linux.
+- Produces: `AnalystRuntime.start/stop`, unidade `statistical-analyst.service`, logs estruturados redigidos no `journald`, retenção/backup de 90 dias e preflight real de implantação.
 
 - [ ] **Step 1: Escrever testes de lifecycle, redaction e retenção**
 
@@ -1873,7 +2020,7 @@ def test_stop_cancels_analysis_and_drains_completed_outbox(runtime, fake_compone
     runtime.start()
     runtime.stop(grace_seconds=30)
     assert fake_components.scheduler.stopped
-    assert fake_components.openai.cancelled
+    assert fake_components.claude.cancelled
     assert fake_components.analytics_writer.closed
     assert fake_components.core_components_touched == 0
 
@@ -1900,8 +2047,8 @@ def test_runtime_loads_only_installed_resources_outside_repo(runtime, fake_compo
 
 # tests/unit/test_analyst_log_redaction.py
 def test_logs_never_emit_prompts_responses_recipients_or_secrets(caplog, redacting_logger) -> None:
-    redacting_logger.analysis_failed(api_key="sk-secret", recipient="x@gmail.com", response='{"summary":"raw"}')
-    assert "sk-secret" not in caplog.text
+    redacting_logger.analysis_failed(api_key="sk-ant-secret", recipient="x@gmail.com", response='{"summary":"raw"}')
+    assert "sk-ant-secret" not in caplog.text
     assert "x@gmail.com" not in caplog.text
     assert '"summary":"raw"' not in caplog.text
 
@@ -1913,13 +2060,24 @@ def test_cleanup_keeps_last_ninety_days_and_backup_is_consistent(analytics_db, n
     assert integrity_check(backup_path) == "ok"
 ```
 
+```python
+# tests/integration/test_operational_readonly_permissions.py
+def test_analyst_group_can_read_wal_database_but_never_write(core_db_as_other_user, analyst_identity) -> None:
+    conn = analyst_identity.connect(f"file:{core_db_as_other_user}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only=ON")
+    assert conn.execute("SELECT count(*) FROM raw_events").fetchone()[0] >= 0
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("UPDATE raw_events SET topic=topic")
+    assert analyst_identity.cannot_create_file_in(core_db_as_other_user.parent)
+```
+
 - [ ] **Step 2: Executar os testes e confirmar a falha**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py -v`
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py tests/integration/test_operational_readonly_permissions.py -v`
 
 Expected: FAIL por runtime e rotinas ausentes.
 
-- [ ] **Step 3: Implementar composição, serviço e preflight seguro**
+- [ ] **Step 3: Implementar composição, unidade systemd e preflight seguro**
 
 ```python
 # src/statistical_analyst/service/runtime.py
@@ -1932,42 +2090,137 @@ class AnalystRuntime:
             stop_event=self._stop_event,
         )
         self._analytics_db.migrate()
+        self._claude_transport.preflight()   # versão do CLI, workdir vazio, HOME sem configuração
         self._dispatcher.start(self._stop_event)
         self._scheduler.start(self._stop_event)
+        self._notifier.notify("READY=1\nSTATUS=scheduler running")
 
     def stop(self, grace_seconds: float = 30.0) -> None:
+        self._notifier.notify("STOPPING=1")
         self._stop_event.set()
-        self._coordinator.cancel_pending()
+        self._coordinator.cancel_pending()   # mata os grupos de processos `claude` ainda vivos
         self._scheduler.join(timeout=grace_seconds)
         self._dispatcher.drain_confirmed(timeout=grace_seconds)
         self._analytics_db.close()
 ```
 
-`OperationalReadiness` abre somente `mode=ro`, espera com backoff limitado até 120 segundos por arquivo, linha `operational_contract.ready=1`, `runtime_health.core_ready=1`, versão/hash/rule version conhecidos e schema exato; respeita stop event e jamais cria/migra tabela operacional. Versão/hash incompatível falha imediatamente; ausência ou `ready=0` pode esperar até o timeout e então encerra o serviço com código não zero para recovery do SCM.
+`OperationalReadiness` faz o seguinte:
 
-`windows_service.py` usa `pywin32`, traduz SCM stop para o mesmo event e configura o processo como `BELOW_NORMAL_PRIORITY_CLASS`; nunca importa nem inicia o runtime do MQTT Core. O instalador exige conta de serviço dedicada, caminhos absolutos distintos, automatic delayed start e recovery actions e registra `AgenteMqttCore` como dependência SCM explícita de `StatisticalAnalyst`; testa em reboot que o Core chega a RUNNING/ready antes da análise. Aplica ACL somente à conta e administradores. Antes de alterar ACL/serviço, valida exatamente cada destino e aborta se estiver fora do diretório configurado. Para `operational.sqlite` e seu diretório, exige ACE explícita Read+Traverse da conta analítica e verifica ausência de Create/Write/Delete tanto no arquivo principal quanto em `-wal`/`-shm`; o preflight tenta criar um arquivo sentinela e executar UPDATE sob o token real da conta e ambos devem falhar.
+- abre somente `mode=ro`;
+- espera, com backoff limitado a 120 segundos por arquivo, até encontrar `operational_contract.ready=1`, `runtime_health.core_ready=1`, versão/hash/rule version conhecidos e o schema exato;
+- respeita o stop event e jamais cria ou migra tabela operacional;
+- com versão ou hash incompatível, falha imediatamente;
+- com o arquivo ausente ou `ready=0`, espera até o timeout e então encerra com código ≠ 0, para o `systemd` reiniciar (`Restart=on-failure`).
 
-O instalador resolve as fontes empacotadas em `<venv-data>\share\agente-mqtt\contracts` e `<venv-data>\share\agente-mqtt\statistical-analyst`, verifica os hashes aprovados e copia contrato, prompt e catálogo via temporário + rename para os subdiretórios de `resource_directory`; aplica ACL somente de leitura à conta analítica. O composition root injeta esse diretório em reader, request builder e renderer. Serviço e verificadores falham antes do scheduler se qualquer recurso faltar/divergir e o teste executa com CWD fora do repositório.
+`linux_service.py` traduz `SIGTERM`/`SIGINT` para o mesmo stop event e envia `READY=1`/`WATCHDOG=1`/`STOPPING=1`. Ele nunca importa nem inicia o runtime do MQTT Core.
 
-O composition root de produção instancia um único `WindowsCredentialProvider` sob a conta do serviço e o injeta nos factories OpenAI/Gmail. O instalador não recebe nem grava valores secretos: imprime os dois target names, exige que sejam provisionados no Credential Manager da conta dedicada e executa um probe redigido sob esse token. O teste operacional provisiona um target descartável, lê-o através do processo do serviço, rotaciona o valor, executa nova tentativa fake (sem rede) e comprova que o novo valor foi usado; em seguida revoga o target e confirma falha segura sem revelar o conteúdo. `OPENAI_API_KEY` é aceito somente pelo harness live interativo, nunca pelo Windows Service.
+```ini
+# deploy/systemd/statistical-analyst.service
+[Unit]
+Description=Statistical Analyst consultivo (Claude Code headless)
+Requires=mqtt-core.service
+After=mqtt-core.service network-online.target time-sync.target
+Wants=network-online.target
 
-`verify-statistical-analyst.ps1` deve reprovar implantação se o banco operacional não puder ser aberto read-only, se `analytics.sqlite` for gravável por identidades não autorizadas, ou se volumes de banco/backup não informarem BitLocker ativo. Backup usa `sqlite3.Connection.backup()`, não cópia direta de `.sqlite`/WAL. O teste unitário não simula conformidade de ACL/BitLocker; o teste operacional roda em Windows elevado e verifica o estado real.
+[Service]
+Type=notify
+NotifyAccess=main
+User=agente-analista
+Group=agente-analista
+SupplementaryGroups=agente-mqtt-ro
+WorkingDirectory=/
+ExecStart=/opt/agente-mqtt/venv/bin/python -m statistical_analyst run --config /etc/agente-mqtt/statistical-analyst.toml
+Restart=on-failure
+RestartSec=30
+WatchdogSec=300
+TimeoutStopSec=40
+KillMode=control-group
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryMax=1G
+TasksMax=64
+LoadCredential=claude.credential:/etc/credstore/agente-analista/claude.credential
+LoadCredential=gmail.username:/etc/credstore/agente-analista/gmail.username
+LoadCredential=gmail.app_password:/etc/credstore/agente-analista/gmail.app_password
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/agente-mqtt /opt/agente-mqtt /opt/claude-code /etc/agente-mqtt
+ReadWritePaths=/var/lib/agente-analista /var/backups/agente-analista /var/log/agente-analista
 
-- [ ] **Step 4: Executar testes portáveis e smoke test Windows**
+[Install]
+WantedBy=multi-user.target
+```
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py -v`
+Observações sobre a unidade:
+
+- `MemoryDenyWriteExecute` **não** é usado, porque o Node.js do Claude Code precisa de JIT. Essa é a única diferença de endurecimento em relação ao Core e fica registrada na saída do verificador.
+- `Requires=`/`After=` garantem que o Core sobe antes. O `READY` do Analyst só sai depois do contrato `ready=1`.
+- `KillMode=control-group` garante que nenhum processo `claude` sobreviva ao stop.
+
+`scripts/install-statistical-analyst.sh` (`set -euo pipefail`, exige `root`, idempotente):
+
+- cria o usuário de sistema `agente-analista` (sem shell) e o adiciona **somente** ao grupo `agente-mqtt-ro`;
+- cria os diretórios `/var/lib/agente-analista` (`0700`), `claude-empty` (`0500`, vazio), `claude-home` (`0700`), `/var/backups/agente-analista` e `/var/log/agente-analista`;
+- instala o Claude Code CLI na versão `claude_cli_version` em `/opt/claude-code`, com dono `root` e modo `0755`, sem autoatualização. A instalação usa o instalador oficial ou o pacote npm na versão exata, e o hash do binário/pacote resultante é registrado;
+- resolve as fontes empacotadas em `<venv>/share/agente-mqtt/contracts` e `<venv>/share/agente-mqtt/statistical-analyst`, verifica os hashes aprovados e copia contrato, prompt e catálogos por arquivo temporário + `mv` para `resource_directory`, com dono `root` e modo `0644`;
+- instala a unidade e roda `systemd-analyze verify` e `systemctl daemon-reload`/`enable`;
+- antes de alterar qualquer caminho, valida exatamente cada destino e aborta se estiver fora do diretório configurado;
+- **não** recebe nem grava segredos: imprime os três caminhos em `/etc/credstore/agente-analista/` a provisionar (modo `0600`, dono `root`) e o valor esperado de `claude_credential_kind`.
+
+O composition root de produção instancia um único `SystemdCredentialProvider` e o injeta no transporte Claude e no Gmail. Teste operacional da credencial:
+
+- provisiona uma credencial descartável e a lê pelo processo do serviço;
+- rotaciona o valor, reinicia o serviço, executa nova tentativa com o CLI falso (sem rede) e comprova que o novo valor foi usado;
+- remove a credencial e confirma falha segura, sem revelar o conteúdo.
+
+`ANTHROPIC_API_KEY` no ambiente do shell só é aceita pelo harness live interativo, nunca pela unidade `systemd`.
+
+`verify-statistical-analyst.sh` reprova a implantação em qualquer um destes casos:
+
+- o banco operacional não abre como `agente-analista` em `mode=ro`, ou um `UPDATE`/arquivo sentinela **consegue** ser feito com a identidade real (`runuser -u agente-analista`);
+- `analytics.sqlite` é legível ou gravável por outro usuário;
+- `claude --version` diverge da configuração;
+- `claude-empty` não está vazio;
+- `claude-home` contém `settings.json`, `CLAUDE.md`, agentes, skills, plugins ou configuração MCP;
+- `systemd-analyze security statistical-analyst.service` passa do limite registrado;
+- o volume de dados não está cifrado (LUKS) e falta a flag `--accept-provider-encryption`.
+
+O backup usa `sqlite3.Connection.backup()`, nunca cópia direta de `.sqlite`/WAL, e segue para o mesmo destino externo cifrado do Core. O teste unitário não simula permissões nem cifragem; o teste operacional roda como `root` na VPS de homologação e verifica o estado real.
+
+- [ ] **Step 4: Executar testes portáveis e smoke test na VPS**
+
+Run: `.venv/bin/python -m pytest tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py tests/integration/test_operational_readonly_permissions.py -v`
 
 Expected: PASS.
 
-Run em runner Windows administrativo: `.venv\Scripts\python.exe -m pytest tests/operational/test_statistical_analyst_service.py -v --run-operational`
+Run como `root` na VPS de homologação: `sudo .venv/bin/python -m pytest tests/operational/test_statistical_analyst_service.py -v --run-operational`
 
-Expected: serviço instala com dependência `AgenteMqttCore`, inicia com prioridade BELOW_NORMAL somente após contrato ready, carrega recursos absolutos e credenciais rotacionáveis sob sua conta, para em até 30 segundos, reinicia por SCM/reboot e mantém os dois bancos/outboxes isolados.
+Expected: PASS. O teste comprova que o serviço:
+
+- sobe depois de `mqtt-core.service`, com `Nice=10`, e envia `READY` só após o contrato ready;
+- carrega recursos absolutos e credenciais via `LoadCredential`;
+- para em até 30 segundos sem processos `claude` remanescentes;
+- reinicia por `systemd` e após reboot;
+- mantém os dois bancos e as duas outboxes isolados.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/statistical_analyst/__main__.py src/statistical_analyst/observability.py src/statistical_analyst/security.py src/statistical_analyst/service scripts/install-statistical-analyst.ps1 scripts/uninstall-statistical-analyst.ps1 scripts/verify-statistical-analyst.ps1 tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py tests/operational/test_statistical_analyst_service.py
-git commit -m "feat: operate isolated statistical analyst service"
+```bash
+git add src/statistical_analyst/__main__.py src/statistical_analyst/observability.py src/statistical_analyst/security.py src/statistical_analyst/service deploy/systemd/statistical-analyst.service scripts/install-statistical-analyst.sh scripts/uninstall-statistical-analyst.sh scripts/verify-statistical-analyst.sh tests/unit/test_analyst_runtime.py tests/unit/test_analyst_log_redaction.py tests/integration/test_analytics_retention_backup.py tests/integration/test_operational_readiness.py tests/integration/test_operational_readonly_permissions.py tests/operational/test_statistical_analyst_service.py
+git commit -m "feat: operate isolated statistical analyst systemd service"
 ```
 
 ### Task 19: Gates dourados, isolamento E2E, testes live e piloto
@@ -1978,35 +2231,36 @@ git commit -m "feat: operate isolated statistical analyst service"
 - Create: `tests/fixtures/golden/overflowing.json`
 - Create: `tests/fixtures/golden/data_quality_failures.json`
 - Create: `tests/fixtures/golden/historical_and_alarm_cases.json`
-- Create: `tests/fixtures/golden/openai_failures.json`
+- Create: `tests/fixtures/golden/claude_failures.json`
 - Create: `tests/e2e/test_mqtt_core_isolation.py`
 - Create: `tests/e2e/test_retention_snapshot_contract.py`
 - Create: `tests/e2e/test_full_analysis_report.py`
 - Create: `tests/e2e/conftest.py`
 - Create: `tests/e2e/harness.py`
-- Create: `tests/live/test_openai_contract.py`
+- Create: `tests/live/test_claude_contract.py`
+- Create: `tests/live/test_capture_cli_fixtures.py`
 - Create: `tests/live/test_fixture_token_counts.py`
 - Create: `src/statistical_analyst/pilot/__init__.py`
 - Create: `src/statistical_analyst/pilot/evaluator.py`
 - Create: `tests/unit/test_pilot_evaluator.py`
 - Modify: `tests/conftest.py`
-- Create: `scripts/run-statistical-pilot.ps1`
-- Create: `scripts/evaluate-statistical-pilot.ps1`
+- Create: `scripts/run-statistical-pilot.sh`
+- Create: `scripts/evaluate-statistical-pilot.sh`
 - Create: `docs/runbooks/statistical-analyst-pilot.md`
 - Create: `docs/runbooks/statistical-analyst-operations.md`
 
 **Interfaces:**
-- Consumes: sistema completo, broker/SMTP/OpenAI fakes, chave de projeto opt-in e ficha de avaliação humana.
+- Consumes: sistema completo, broker/SMTP/CLI Claude falsos, credencial Claude opt-in e ficha de avaliação humana.
 - Produces: gates automatizados, relatório de piloto e decisão explícita `PROMOTE`, `EXTEND` ou `BLOCK`.
 
-`tests/conftest.py` deve preservar a implementação única criada pelo Core; apenas completar o gating de `--run-live` e `--run-operational` se ainda necessário, sem redefinir opções. `tests/e2e/harness.py` possui `SystemHarness`, `GoldenHarness`, `GOLDEN_SCENARIOS` e builders dos fakes broker/SMTP/OpenAI; `tests/e2e/conftest.py` expõe essas fixtures. No teste de isolamento, cada runtime é iniciado em subprocesso separado; o processo analítico não importa o composition root do Core.
+`tests/conftest.py` deve preservar a implementação única criada pelo Core; apenas completar o gating de `--run-live` e `--run-operational` se ainda necessário, sem redefinir opções. `tests/e2e/harness.py` possui `SystemHarness`, `GoldenHarness`, `GOLDEN_SCENARIOS` e builders dos fakes broker/SMTP/CLI Claude; `tests/e2e/conftest.py` expõe essas fixtures. No teste de isolamento, cada runtime é iniciado em subprocesso separado; o processo analítico não importa o composition root do Core.
 
 - [ ] **Step 1: Escrever matriz dourada e teste de isolamento crítico**
 
 ```python
 # tests/e2e/test_mqtt_core_isolation.py
 def test_slow_saturated_analyst_cannot_delay_core_persistence_or_critical_alert(system_harness) -> None:
-    system_harness.openai.block_for(seconds=240)
+    system_harness.claude.block_for(seconds=240)
     analysis = system_harness.start_analysis_window()
     event = system_harness.publish("EPZ/META/0051/ANI01/RAW", b"900", qos=1)
     assert system_harness.core.wait_persisted(event, within_seconds=5)
@@ -2040,11 +2294,11 @@ def test_golden_scenario_has_exact_local_result_and_safe_report(fixture_name, ha
     assert actual.safety_violations == []
 ```
 
-Os fixtures cobrem: normal, secagem, extravasamento, variabilidade, ausência, travamento, inválido, salto `>0.4`, histórico insuficiente, alarme ativo, tentativa de reduzir alarme, timeout/408/409/5xx/429, crédito/spend/auth/permissão, schema inválido, budgets esgotados, ausência de usage e bloqueio de segredo/e-mail.
+Os fixtures cobrem: normal, secagem, extravasamento, variabilidade, ausência, travamento, inválido, salto `>0.4`, histórico insuficiente, alarme ativo, tentativa de reduzir alarme, timeout do subprocesso, sobrecarga/5xx/rate limit, crédito/cota da assinatura/auth, `error_max_budget_usd`, versão do CLI divergente, tentativa de ferramenta, modelo divergente em `modelUsage`, schema inválido, budgets de tokens e USD esgotados, ausência de usage e bloqueio de segredo/e-mail.
 
 - [ ] **Step 2: Executar suites sem rede e confirmar falhas iniciais**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v`
+Run: `.venv/bin/python -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v`
 
 Expected: FAIL até fixtures, harness e verificações finais existirem.
 
@@ -2054,18 +2308,34 @@ Expected: FAIL até fixtures, harness e verificações finais existirem.
 # tests/live/test_fixture_token_counts.py
 @pytest.mark.live
 @pytest.mark.parametrize("fixture", all_request_fixtures())
-def test_official_input_token_count_is_within_budget(openai_client, fixture) -> None:
-    count = openai_client.responses.input_tokens.count(**build_count_request(fixture))
-    assert count.input_tokens <= 5000
+def test_effective_input_tokens_reported_by_cli_are_within_budget(live_transport, request_builder, fixture) -> None:
+    envelope = run(live_transport.analyze(request_builder.prepare(fixture), uuid4()))
+    u = envelope.usage
+    assert u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens <= 5000
+    assert u.output_tokens <= 4000
 
-# tests/live/test_openai_contract.py
+# tests/live/test_claude_contract.py
 @pytest.mark.live
-def test_luna_returns_strict_completed_contract(live_transport, request_builder, sealed_normal_input) -> None:
+def test_fixed_model_returns_valid_structured_output_without_tools(live_transport, request_builder, sealed_normal_input) -> None:
     prepared = request_builder.prepare(sealed_normal_input)
     envelope = run(live_transport.analyze(prepared, uuid4()))
-    assert envelope.status == "completed"
-    assert envelope.model == "gpt-5.6-luna"
+    assert envelope.subtype == "success" and envelope.is_error is False
+    assert set(envelope.model_usage) == {"claude-sonnet-5-5"}
+    assert envelope.tool_use_count == 0 and envelope.permission_denials == []
     assert validate_response(envelope, sealed_normal_input).is_valid
+
+@pytest.mark.live
+def test_prompt_injection_asking_for_file_read_cannot_use_tools(live_transport, request_builder, sealed_injection_input) -> None:
+    envelope = run(live_transport.analyze(request_builder.prepare(sealed_injection_input), uuid4()))
+    assert envelope.tool_use_count == 0 and envelope.permission_denials == []
+    assert "/etc/" not in json.dumps(envelope.structured_output or {})
+
+# tests/live/test_capture_cli_fixtures.py
+@pytest.mark.live
+def test_capture_success_and_error_envelopes_for_pinned_cli(live_transport, capture_dir) -> None:
+    capture = capture_cli_envelopes(live_transport, cases=["success", "invalid_credential", "tiny_budget"])
+    assert capture.cli_version == live_transport.config.claude_cli_version
+    write_redacted_fixtures(capture, capture_dir)   # revisão humana antes de copiar para tests/fixtures/claude_cli
 ```
 
 ```python
@@ -2103,39 +2373,39 @@ def test_evaluator_always_reports_all_fourteen_named_gates() -> None:
 
 `PilotEvaluator` usa inteiros/Fraction, persiste numerador, denominador, evidência e estado de cada um dos 14 critérios; nunca arredonda percentuais para aprovar. Para zero achados, o gate de não sustentados só passa se o numerador também for zero e registra denominador zero explicitamente. Gate ausente, revisão humana incompleta ou discordância pendente nunca promove. Violação de segurança, privacidade, orçamento ou isolamento gera `BLOCK` imediato; amostra/nota ainda incompleta gera `EXTEND` no dia 7 e `BLOCK` no dia 14; `PROMOTE` exige ao menos 7 dias, 42 execuções, 60 seções válidas, aprovação de processamento de dados e todos os 14 gates aprovados.
 
-Testes `live` exigem simultaneamente `--run-live`, `OPENAI_API_KEY` do projeto dedicado e `OPENAI_LIVE_COST_ACCEPTED=YES`; ficam fora do CI normal. Registrar separadamente custo, request IDs e contagens, sem guardar conteúdo em logs. `run-statistical-pilot.ps1` coleta continuamente desde a ativação, sem parar em 42 execuções quando a decisão for `EXTEND`, e encerra somente em `PROMOTE`, `BLOCK` ou 14 dias. `evaluate-statistical-pilot.ps1` chama o mesmo `PilotEvaluator` Python, não reimplementa fórmulas em PowerShell, e emite relatório assinado com os 14 gates e denominadores.
+Os testes `live` exigem ao mesmo tempo `--run-live`, a credencial dedicada (`ANTHROPIC_API_KEY` do workspace do agente ou `CLAUDE_CODE_OAUTH_TOKEN` do piloto) e `CLAUDE_LIVE_COST_ACCEPTED=YES`, e ficam fora do CI normal. Eles usam o binário real em `claude_cli_path`, com a mesma argv e o mesmo ambiente mínimo da produção. Custo (`total_cost_usd`), `session_id` e contagens são registrados à parte, sem guardar conteúdo em logs. As fixtures capturadas da versão fixada substituem as da Task 12 só depois de revisão humana. `run-statistical-pilot.sh` coleta continuamente desde a ativação, sem parar em 42 execuções quando a decisão for `EXTEND`, e encerra somente em `PROMOTE`, `BLOCK` ou 14 dias. `evaluate-statistical-pilot.sh` chama o mesmo `PilotEvaluator` Python, não reimplementa fórmulas em shell, e emite relatório assinado com os 14 gates e denominadores.
 
-O runbook de operações cobre instalação do wheel sem checkout, paths/hashes dos três recursos, targets do Credential Manager, rotação e revogação sob a conta de serviço, dependência/ready do Core, recuperação de `DELIVERY_UNCERTAIN`, circuit breaker/budget, restore do banco analítico e rollback que preserva a versão anterior de recursos. Todos os comandos de verificação devem funcionar com CWD fora do repositório.
+O runbook de operações cobre: instalação do wheel sem checkout; instalação e atualização controlada do Claude Code CLI (nova versão só depois de recapturar as fixtures, rodar os testes live e aprovar); paths/hashes dos recursos; provisionamento das credenciais em `/etc/credstore/agente-analista/`; rotação (arquivo + `systemctl restart`) e revogação, inclusive revogar a chave no Console da Anthropic ou o token OAuth; limite de gasto do workspace; dependência/ready do Core, recuperação de `DELIVERY_UNCERTAIN`, circuit breaker/budget, restore do banco analítico e rollback que preserva a versão anterior de recursos. Todos os comandos de verificação devem funcionar com CWD fora do repositório.
 
 - [ ] **Step 4: Executar todos os gates apropriados**
 
-Run: `.venv\Scripts\python.exe -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v --cov=agente_mqtt --cov=statistical_analyst --cov-report=term-missing --cov-fail-under=90`
+Run: `.venv/bin/python -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v --cov=agente_mqtt --cov=statistical_analyst --cov-report=term-missing --cov-fail-under=90`
 
 Expected: PASS; nenhuma chamada de rede real.
 
-Run autorizado antes do piloto: `.venv\Scripts\python.exe -m pytest tests/live -v --run-live`
+Run autorizado antes do piloto: `.venv/bin/python -m pytest tests/live -v --run-live`
 
-Expected: PASS para acesso ao modelo, Structured Output e todas as fixtures com `input_tokens <= 5000`.
+Expected: PASS para acesso ao modelo fixo, saída estruturada válida, nenhuma ferramenta usada mesmo com prompt injection, e todas as fixtures com entrada efetiva ≤ 5.000 tokens.
 
-Run no host Windows de piloto: `powershell -ExecutionPolicy Bypass -File scripts/verify-statistical-analyst.ps1`
+Run como `root` na VPS de piloto: `sudo scripts/verify-statistical-analyst.sh --config /etc/agente-mqtt/statistical-analyst.toml`
 
-Expected: PASS para conta, ACL, BitLocker, paths, serviço, acesso read-only e bancos separados.
+Expected: PASS para usuário, permissões, cifragem, paths, versão do CLI, `HOME`/workdir limpos, serviço, acesso read-only e bancos separados.
 
 - [ ] **Step 5: Commit**
 
-```powershell
-git add src/statistical_analyst/pilot tests/unit/test_pilot_evaluator.py tests/conftest.py tests/fixtures/golden tests/e2e tests/live scripts/run-statistical-pilot.ps1 scripts/evaluate-statistical-pilot.ps1 docs/runbooks/statistical-analyst-pilot.md docs/runbooks/statistical-analyst-operations.md
+```bash
+git add src/statistical_analyst/pilot tests/unit/test_pilot_evaluator.py tests/conftest.py tests/fixtures/golden tests/e2e tests/live scripts/run-statistical-pilot.sh scripts/evaluate-statistical-pilot.sh docs/runbooks/statistical-analyst-pilot.md docs/runbooks/statistical-analyst-operations.md
 git commit -m "test: gate statistical analyst pilot"
 ```
 
 ## Verificação final deste plano
 
-- [ ] Executar `.venv\Scripts\python.exe -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v --cov=agente_mqtt --cov=statistical_analyst --cov-report=term-missing --cov-fail-under=90`.
-- [ ] Executar `.venv\Scripts\python.exe -m compileall -q src tests`.
-- [ ] Executar `.venv\Scripts\python.exe -m pip check` no ambiente criado pelos lockfiles.
-- [ ] Executar `rg -n "TODO|FIXME|pass$|NotImplemented|example\.invalid|sk-" src config scripts docs/runbooks` e resolver qualquer ocorrência executável ou segredo.
+- [ ] Executar `.venv/bin/python -m pytest tests/unit tests/integration tests/e2e -m "not live and not operational and not mosquitto and not soak" -v --cov=agente_mqtt --cov=statistical_analyst --cov-report=term-missing --cov-fail-under=90`.
+- [ ] Executar `.venv/bin/python -m compileall -q src tests`.
+- [ ] Executar `.venv/bin/python -m pip check` no ambiente criado pelos lockfiles.
+- [ ] Executar `rg -n "TODO|FIXME|pass$|NotImplemented|example\.invalid|sk-" src config scripts deploy docs/runbooks` e resolver qualquer ocorrência executável ou segredo.
 - [ ] Verificar que `operational.sqlite` abre com `mode=ro`, `query_only=ON` e que `UPDATE` falha no teste de integração.
-- [ ] Inspecionar o request capturado: modelo fixo, reasoning low, sem tools/history/background, `store=false`, truncation disabled, timeout e retry únicos.
-- [ ] Autorizar custo e executar `tests/live` somente com a chave dedicada antes do piloto.
-- [ ] Executar `scripts/verify-statistical-analyst.ps1` no host Windows real e anexar sua saída ao registro de implantação.
+- [ ] Inspecionar a invocação capturada pelo CLI falso: argv fixo (`--model claude-sonnet-5-5`, `--effort low`, `--tools ""`, `--strict-mcp-config`, `--setting-sources ""`, `--no-session-persistence`, `--json-schema`, `--max-budget-usd`), nenhuma flag proibida, pacote só via `stdin`, CWD vazio, ambiente mínimo, timeout e retry únicos.
+- [ ] Autorizar o custo e executar `tests/live` somente com a credencial dedicada antes do piloto; revisar e versionar as fixtures do CLI capturadas.
+- [ ] Executar `sudo scripts/verify-statistical-analyst.sh` na VPS real e anexar a saída ao registro de implantação.
 - [ ] Rodar o piloto de 7 dias, ou estender até 14 dias conforme a regra de amostra, e obter decisão técnica explícita antes de ativar produção.
