@@ -1,5 +1,8 @@
 # Statistical Analyst OpenAI Implementation Plan
 
+> **Atenção (2026-10-31):** a plataforma mudou de Windows para VPS Linux com systemd, e a camada consultiva passou a usar Claude Code headless. Antes de executar, aplique a seção 6 de `../specs/2026-10-31-migracao-vps-claude-code-design.md`.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Construir um segundo serviço Windows que, a cada 4 horas, calcula estatísticas locais independentes dos reservatórios `0051` e `0022`, solicita interpretação estruturada ao `gpt-5.6-luna` e entrega um único relatório consultivo pelo Gmail com fallback determinístico.

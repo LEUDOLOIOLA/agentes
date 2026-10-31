@@ -1,5 +1,8 @@
 # MQTT Core Implementation Plan
 
+> **Atenção (2026-10-31):** a plataforma mudou de Windows para VPS Linux com systemd, e a camada consultiva passou a usar Claude Code headless. Antes de executar, aplique a seção 6 de `../specs/2026-10-31-migracao-vps-claude-code-design.md`.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Construir o serviço Windows determinístico que recebe continuamente os dois tópicos MQTT, persiste eventos auditáveis, detecta riscos de nível e falhas de medição e entrega alertas pelo Gmail sem controlar equipamentos.

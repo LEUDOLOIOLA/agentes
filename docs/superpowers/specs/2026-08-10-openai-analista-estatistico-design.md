@@ -4,7 +4,7 @@
 - Status: aprovado pelo usuário
 - Especificação-base: `2026-08-08-agente-monitoramento-mqtt-design.md`
 - Plataforma-alvo: serviço Python no Windows
-- Modelo aprovado: `gpt-5.6-luna`
+- Modelo aprovado: `gpt-5.6-luna` — **provedor, modelo e plataforma alterados por `2026-10-31-migracao-vps-claude-code-design.md` (Claude Code headless em VPS Linux)**
 - Natureza: análise consultiva; sem controle de processo
 
 ## 1. Objetivo

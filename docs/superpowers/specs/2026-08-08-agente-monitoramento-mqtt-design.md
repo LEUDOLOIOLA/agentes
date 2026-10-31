@@ -2,7 +2,7 @@
 
 - Data: 2026-08-08
 - Status: aprovado pelo usuário
-- Plataforma-alvo: Windows, em operação contínua
+- Plataforma-alvo: Windows, em operação contínua — **alterada para VPS Linux por `2026-10-31-migracao-vps-claude-code-design.md`**
 - Natureza: supervisão e alertas; sem comando de bombas, válvulas ou PLC
 
 ## 1. Objetivo
