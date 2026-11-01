@@ -1,0 +1,1 @@
+{ "name": "uso-claude", "version": "0.1.0", "description": "Painel com o uso do Claude: contexto, custo, tokens e limites de 5h/7 dias", "types": "./types/index.d.ts" }
